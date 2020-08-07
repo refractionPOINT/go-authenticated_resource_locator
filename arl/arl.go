@@ -73,6 +73,7 @@ var supportedMethods = map[string]map[string]bool{
 	},
 	"github": {
 		"token": true,
+		"": true,
 	},
 }
 
@@ -121,9 +122,10 @@ func NewARL(arl string, maxSize uint64, maxConcurrent uint64) (AuthenticatedReso
 
 	// Resolve the relevant callback for this method.
 	a.get = map[string]func() (chan Content, error){
-		"http":  a.getHTTP,
-		"https": a.getHTTP,
-		"gcs":   a.getGCS,
+		"http":   a.getHTTP,
+		"https":  a.getHTTP,
+		"gcs":    a.getGCS,
+		"github": a.getGitHub,
 	}[a.methodName]
 
 	return a, nil

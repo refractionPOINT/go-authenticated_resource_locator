@@ -20,6 +20,7 @@
 package arl
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -68,5 +69,24 @@ func TestHTTP(t *testing.T) {
 	_, err = a.Fetch()
 	if err == nil {
 		t.Error("non existent https dest failed to produce error")
+	}
+}
+
+func TestGithub(t *testing.T) {
+	a, err := NewARL("[github,Neo23x0/signature-base/yara]", 1024*1024*10, 10)
+	if err != nil {
+		t.Errorf("failed creating github arl: %v", err)
+	}
+
+	ch, err := a.Fetch()
+	if err != nil {
+		t.Errorf("failed fetching github arl: %v", err)
+	} else {
+		nContents := 0
+		for content := range ch {
+			nContents += 1
+			fmt.Printf("Got %s: %d (%v)\n", content.FilePath, len(content.Data), content.Error)
+		}
+		t.Errorf("found %d", nContents)
 	}
 }

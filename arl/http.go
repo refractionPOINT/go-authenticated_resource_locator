@@ -64,7 +64,7 @@ func (a AuthenticatedResourceLocator) getHTTP() (chan Content, error) {
 	}
 
 	if resp.StatusCode != 200 {
-		return nil, ErrorResourceNotFound
+		return nil, fmt.Errorf("failed to get url: %s", resp.Status)
 	}
 
 	b, err := ioutil.ReadAll(resp.Body)
