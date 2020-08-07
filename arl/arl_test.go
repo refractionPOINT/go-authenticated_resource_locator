@@ -20,7 +20,6 @@
 package arl
 
 import (
-	"fmt"
 	"testing"
 )
 
@@ -83,10 +82,11 @@ func TestGithub(t *testing.T) {
 		t.Errorf("failed fetching github arl: %v", err)
 	} else {
 		nContents := 0
-		for content := range ch {
+		for range ch {
 			nContents += 1
-			fmt.Printf("Got %s: %d (%v)\n", content.FilePath, len(content.Data), content.Error)
 		}
-		t.Errorf("found %d", nContents)
+		if nContents < 200 || nContents > 1000 {
+			t.Errorf("unexpected number of resources: %d", nContents)
+		}
 	}
 }

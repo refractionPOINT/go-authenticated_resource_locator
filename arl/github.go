@@ -26,6 +26,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"strings"
+	"sync"
 )
 
 type githubFileRecord struct {
@@ -103,9 +104,14 @@ func (a AuthenticatedResourceLocator) getGitHub() (chan Content, error) {
 	close(chIn)
 
 	chOut := make(chan Content, a.maxConcurrent)
+	wg := sync.WaitGroup{}
 
 	for i := 0; uint64(i) < a.maxConcurrent; i++ {
+		wg.Add(1)
+
 		go func() {
+			defer wg.Done()
+
 			for gr := range chIn {
 				tmpContent := Content{
 					FilePath: gr.Path,
@@ -121,6 +127,11 @@ func (a AuthenticatedResourceLocator) getGitHub() (chan Content, error) {
 			}
 		}()
 	}
+
+	go func(){
+		wg.Wait()
+		close(chOut)
+	}()
 
 	return chOut, nil
 }
