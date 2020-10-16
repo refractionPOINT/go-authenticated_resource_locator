@@ -128,7 +128,7 @@ func (a AuthenticatedResourceLocator) getGitHub() (chan Content, error) {
 		}()
 	}
 
-	go func(){
+	go func() {
 		wg.Wait()
 		close(chOut)
 	}()
@@ -145,7 +145,7 @@ func listGithubFiles(maxSize uint64, baseURL string, auth http.Header, subPath s
 	}
 
 	thisURL := fmt.Sprintf("%s%s%s%s", baseURL, sep, subPath, repoParams)
-	
+
 	body, err := downloadGithubFile(thisURL, auth)
 	if err != nil {
 		return outPaths, err

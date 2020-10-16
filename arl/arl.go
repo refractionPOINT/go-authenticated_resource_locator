@@ -73,7 +73,7 @@ var supportedMethods = map[string]map[string]bool{
 	},
 	"github": {
 		"token": true,
-		"": true,
+		"":      true,
 	},
 }
 

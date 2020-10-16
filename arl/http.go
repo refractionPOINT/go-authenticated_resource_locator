@@ -32,7 +32,7 @@ func (a AuthenticatedResourceLocator) getHTTP() (chan Content, error) {
 	if a.methodName == "http" {
 		fullURL = fmt.Sprintf("http://%s", a.methodDest)
 	} else if a.methodName == "https" {
-		fullURL = fmt.Sprintf("http://%s", a.methodDest)
+		fullURL = fmt.Sprintf("https://%s", a.methodDest)
 	} else {
 		return nil, ErrorMethodNotImplemented
 	}
