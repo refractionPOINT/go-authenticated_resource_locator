@@ -240,6 +240,7 @@ func downloadGithubFile(url string, auth http.Header) ([]byte, error) {
 		return data, err
 	}
 	req.Header = auth
+	req.Header.Set("User-Agent", "AuthenticatedResourceLocator/Go")
 
 	client := http.Client{}
 
