@@ -239,7 +239,13 @@ func downloadGithubFile(url string, auth http.Header) ([]byte, error) {
 	if err != nil {
 		return data, err
 	}
-	req.Header = auth
+
+	// Copy the headers since they're not thread safe.
+	headers := http.Header{}
+	for k, v := range auth {
+		headers[k] = v
+	}
+	req.Header = headers
 	req.Header.Set("User-Agent", "AuthenticatedResourceLocator/Go")
 
 	client := http.Client{}
