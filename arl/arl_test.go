@@ -71,6 +71,34 @@ func TestHTTP(t *testing.T) {
 	}
 }
 
+func TestHTTPS(t *testing.T) {
+	a, err := NewARL("https://app.limacharlie.io/get/windows/64", 1024*1024*10, 3)
+	if err != nil {
+		t.Errorf("failed to creating https ARL: %v", err)
+	}
+	ch, err := a.Fetch()
+	if err != nil {
+		t.Errorf("failed fetching https ARL: %v", err)
+	}
+
+	contents := []Content{}
+	for c := range ch {
+		contents = append(contents, c)
+	}
+
+	if len(contents) != 1 {
+		t.Errorf("unexpected number of files from https ARL: %d", len(contents))
+	}
+
+	content := contents[0]
+	if content.Error != nil {
+		t.Errorf("unexpected error fetching https ARL: %v", content.Error)
+	}
+	if len(content.Data) < 1024 || len(content.Data) > 1024*1024*20 {
+		t.Errorf("unexpected data size from https ARL: %d", len(content.Data))
+	}
+}
+
 func TestGithub(t *testing.T) {
 	a, err := NewARL("[github,Neo23x0/signature-base/yara]", 1024*1024*10, 10)
 	if err != nil {
