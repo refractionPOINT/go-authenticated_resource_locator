@@ -87,7 +87,7 @@ func NewARL(arl string, maxSize uint64, maxConcurrent uint64) (AuthenticatedReso
 	if strings.HasPrefix(arl, "https://") {
 		// This is a shortcut for backwards compatibility.
 		a.methodName = "https"
-		a.methodDest = arl
+		a.methodDest = arl[len("https://"):]
 	} else if strings.HasPrefix(arl, "[") && strings.HasSuffix(arl, "]") {
 		// Remove prefix and suffix.
 		arl = arl[1 : len(arl)-1]
