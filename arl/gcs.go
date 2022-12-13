@@ -40,6 +40,9 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 	}
 	ctx := context.Background()
 	client, err := storage.NewClient(ctx, option.WithCredentialsJSON([]byte(authBlob)))
+	if err != nil {
+		return nil, err
+	}
 
 	components := strings.Split(a.methodDest, "/")
 	bucketName := components[0]
