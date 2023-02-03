@@ -56,15 +56,13 @@ func (a AuthenticatedResourceLocator) getGitHub() (chan Content, error) {
 	} else if len(components) == 3 {
 		repoPath = components[2]
 	} else {
-		return nil, errors.New("github destination should be \"repoOwner/repoName\" or \"repoOwner/repoName/repoSubDir\".")
+		return nil, errors.New(`github destination should be "repoOwner/repoName" or "repoOwner/repoName/repoSubDir"`)
 	}
 
 	repoOwner := components[0]
 	repoName := components[1]
 
-	if strings.HasSuffix(repoPath, "/") {
-		repoPath = repoPath[0 : len(repoPath)-1]
-	}
+	repoPath = strings.TrimSuffix(repoPath, "/")
 
 	fullURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/", repoOwner, repoName)
 
@@ -139,13 +137,8 @@ func (a AuthenticatedResourceLocator) getGitHub() (chan Content, error) {
 func listGithubFiles(maxSize uint64, baseURL string, auth http.Header, subPath string, repoParams string) ([]githubFileRecord, error) {
 	outPaths := []githubFileRecord{}
 
-	sep := ""
-	if subPath != "" {
-		sep = "/"
-	}
-
-	thisURL := fmt.Sprintf("%s%s%s%s", baseURL, sep, subPath, repoParams)
-
+	thisURL := fmt.Sprintf("%s%s%s", baseURL, subPath, repoParams)
+	fmt.Println(thisURL)
 	body, err := downloadGithubFile(thisURL, auth)
 	if err != nil {
 		return outPaths, err
