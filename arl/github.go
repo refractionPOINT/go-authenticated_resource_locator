@@ -27,6 +27,10 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/storage/memory"
 )
 
 type githubFileRecord struct {
@@ -35,6 +39,81 @@ type githubFileRecord struct {
 }
 
 func (a AuthenticatedResourceLocator) getGitHub() (chan Content, error) {
+	if a.authType == "" {
+		// If there is no auth, we can use the git package.
+		return a.getGitHubFromGit()
+	}
+
+	// With a token, use the API.
+	return a.getGitHubFromAPI()
+}
+
+func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
+	// Get the repo name itself. It's the first 2 components.
+	components := strings.Split(a.methodDest, "/")
+	if len(components) < 2 {
+		return nil, errors.New(`github destination should be "repoOwner/repoName" or "repoOwner/repoName/repoSubDir"`)
+	}
+	repoPath := strings.Join(components[:2], "/")
+	pathInRepo := ""
+	if len(components) > 2 {
+		pathInRepo = strings.Join(components[2:], "/")
+	}
+
+	// Clone the repo in memory.
+	r, err := git.Clone(memory.NewStorage(), nil, &git.CloneOptions{
+		URL: fmt.Sprintf("https://github.com/%s", repoPath),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// We default to the HEAD.
+	ref, err := r.Head()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the commit object at HEAD.
+	commit, err := r.CommitObject(ref.Hash())
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the tree at the commit.
+	tree, err := commit.Tree()
+	if err != nil {
+		return nil, err
+	}
+
+	// Start iterating through all the files.
+	chOut := make(chan Content, a.maxConcurrent)
+	go func() {
+		defer close(chOut)
+		tree.Files().ForEach(func(f *object.File) error {
+			if !strings.HasPrefix(f.Name, pathInRepo) {
+				return nil
+			}
+			reader, err := f.Blob.Reader()
+			if err != nil {
+				return err
+			}
+			data, err := ioutil.ReadAll(reader)
+			if err != nil {
+				return err
+			}
+			chOut <- Content{
+				FilePath: f.Name,
+				Data:     data,
+			}
+			return nil
+		})
+	}()
+
+	return chOut, nil
+}
+
+func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 	repoParams := ""
 
 	if strings.Contains(a.methodDest, "?") {
