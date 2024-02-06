@@ -29,6 +29,7 @@ import (
 	"sync"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/storage/memory"
 )
@@ -49,41 +50,55 @@ func (a AuthenticatedResourceLocator) getGitHub() (chan Content, error) {
 }
 
 func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
+	// If the path in repo ends with "?ref=...", we extract the
+	// ref name we want to look for.
+	targetRef := plumbing.ReferenceName("")
+	pathInRepo := ""
+	dest := a.methodDest
+	if strings.Contains(a.methodDest, "?ref=") {
+		components := strings.SplitN(a.methodDest, "?ref=", 2)
+		if len(components) != 2 {
+			return nil, errors.New("invalid github path")
+		}
+		dest = components[0]
+		targetRef = plumbing.ReferenceName(fmt.Sprintf("refs/heads/%s", components[1]))
+	}
+
 	// Get the repo name itself. It's the first 2 components.
-	components := strings.Split(a.methodDest, "/")
+	components := strings.Split(dest, "/")
 	if len(components) < 2 {
 		return nil, errors.New(`github destination should be "repoOwner/repoName" or "repoOwner/repoName/repoSubDir"`)
 	}
 	repoPath := strings.Join(components[:2], "/")
-	pathInRepo := ""
 	if len(components) > 2 {
 		pathInRepo = strings.Join(components[2:], "/")
 	}
 
 	// Clone the repo in memory.
 	r, err := git.Clone(memory.NewStorage(), nil, &git.CloneOptions{
-		URL: fmt.Sprintf("https://github.com/%s", repoPath),
+		URL:           fmt.Sprintf("https://github.com/%s", repoPath),
+		ReferenceName: targetRef,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to clone repo: %v", err)
 	}
 
 	// We default to the HEAD.
 	ref, err := r.Head()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get HEAD: %v", err)
 	}
 
 	// Get the commit object at HEAD.
 	commit, err := r.CommitObject(ref.Hash())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get commit: %v", err)
 	}
 
 	// Get the tree at the commit.
 	tree, err := commit.Tree()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get tree: %v", err)
 	}
 
 	// Start iterating through all the files.
@@ -96,11 +111,11 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 			}
 			reader, err := f.Blob.Reader()
 			if err != nil {
-				return err
+				return fmt.Errorf("failed to get blob reader: %v", err)
 			}
 			data, err := ioutil.ReadAll(reader)
 			if err != nil {
-				return err
+				return fmt.Errorf("failed to read blob: %v", err)
 			}
 			chOut <- Content{
 				FilePath: f.Name,

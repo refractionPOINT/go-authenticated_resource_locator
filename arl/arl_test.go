@@ -100,7 +100,7 @@ func TestHTTPS(t *testing.T) {
 }
 
 func TestGithub(t *testing.T) {
-	a, err := NewARL("[github,Neo23x0/signature-base/yara]", 1024*1024*10, 10)
+	a, err := NewARL("[github,refractionPOINT/python-limacharlie?ref=master]", 1024*1024*10, 10)
 	if err != nil {
 		t.Errorf("failed creating github arl: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestGithub(t *testing.T) {
 		for range ch {
 			nContents += 1
 		}
-		if nContents < 200 || nContents > 1000 {
+		if nContents < 50 || nContents > 100 {
 			t.Errorf("unexpected number of resources: %d", nContents)
 		}
 	}
