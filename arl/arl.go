@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 )
 
@@ -38,6 +39,8 @@ type AuthenticatedResourceLocator struct {
 	methodDest string
 	authType   string
 	authData   string
+
+	httpClient *http.Client
 
 	get func() (chan Content, error)
 }
@@ -77,11 +80,12 @@ var supportedMethods = map[string]map[string]bool{
 	},
 }
 
-func NewARL(arl string, maxSize uint64, maxConcurrent uint64) (AuthenticatedResourceLocator, error) {
+func NewARLWithClient(arl string, maxSize uint64, maxConcurrent uint64, client *http.Client) (AuthenticatedResourceLocator, error) {
 	a := AuthenticatedResourceLocator{
 		arl:           arl,
 		maxSize:       maxSize,
 		maxConcurrent: maxConcurrent,
+		httpClient:    client,
 	}
 
 	if strings.HasPrefix(arl, "https://") {
@@ -129,6 +133,10 @@ func NewARL(arl string, maxSize uint64, maxConcurrent uint64) (AuthenticatedReso
 	}[a.methodName]
 
 	return a, nil
+}
+
+func NewARL(arl string, maxSize uint64, maxConcurrent uint64) (AuthenticatedResourceLocator, error) {
+	return NewARLWithClient(arl, maxSize, maxConcurrent, http.DefaultClient)
 }
 
 func (a *AuthenticatedResourceLocator) Fetch() (chan Content, error) {
