@@ -37,8 +37,6 @@ func (a AuthenticatedResourceLocator) getHTTP() (chan Content, error) {
 		return nil, ErrorMethodNotImplemented
 	}
 
-	client := &http.Client{}
-
 	req, err := http.NewRequest("GET", fullURL, nil)
 	if err != nil {
 		return nil, err
@@ -58,7 +56,7 @@ func (a AuthenticatedResourceLocator) getHTTP() (chan Content, error) {
 		req.Header.Add("X-OTX-API-KEY", a.authData)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
