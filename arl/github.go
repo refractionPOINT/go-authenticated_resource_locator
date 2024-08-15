@@ -31,6 +31,7 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"github.com/go-git/go-git/v5/storage/memory"
 )
 
@@ -40,7 +41,7 @@ type githubFileRecord struct {
 }
 
 func (a AuthenticatedResourceLocator) getGitHub() (chan Content, error) {
-	if a.authType == "" {
+	if a.authType == "" || a.authType == "ssh" {
 		// If there is no auth, we can use the git package.
 		return a.getGitHubFromGit()
 	}
@@ -74,11 +75,22 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 		pathInRepo = strings.Join(components[2:], "/")
 	}
 
-	// Clone the repo in memory.
-	r, err := git.Clone(memory.NewStorage(), nil, &git.CloneOptions{
+	gitOptions := git.CloneOptions{
 		URL:           fmt.Sprintf("https://github.com/%s", repoPath),
 		ReferenceName: targetRef,
-	})
+	}
+
+	if a.authType == "ssh" {
+		gitOptions.URL = fmt.Sprintf("git@github.com:%s", repoPath)
+		pubKey, err := ssh.NewPublicKeys("git", []byte(a.authData), "")
+		if err != nil {
+			return nil, fmt.Errorf("generate publickey failed: %v", err)
+		}
+		gitOptions.Auth = pubKey
+	}
+
+	// Clone the repo in memory.
+	r, err := git.Clone(memory.NewStorage(), nil, &gitOptions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to clone repo: %v", err)
 	}
