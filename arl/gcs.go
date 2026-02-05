@@ -116,6 +116,7 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 
 	go func() {
 		wg.Wait()
+		client.Close()
 		close(chOut)
 	}()
 
