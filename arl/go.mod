@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	cloud.google.com/go/storage v1.56.0
-	github.com/go-git/go-git/v5 v5.19.0
+	github.com/go-git/go-git/v5 v5.19.1
 	google.golang.org/api v0.246.0
 )
 
