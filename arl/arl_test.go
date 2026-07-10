@@ -20,6 +20,7 @@
 package arl
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -110,11 +111,63 @@ func TestGithub(t *testing.T) {
 		t.Errorf("failed fetching github arl: %v", err)
 	} else {
 		nContents := 0
-		for range ch {
+		for c := range ch {
+			if c.Error != nil {
+				t.Errorf("unexpected error fetching github arl: %v", c.Error)
+			}
 			nContents += 1
 		}
-		if nContents < 50 || nContents > 100 {
+		if nContents < 100 || nContents > 1000 {
 			t.Errorf("unexpected number of resources: %d", nContents)
+		}
+	}
+}
+
+func TestGithubSubDir(t *testing.T) {
+	a, err := NewARL("[github,refractionPOINT/python-limacharlie/limacharlie]", 1024*1024*10, 10)
+	if err != nil {
+		t.Errorf("failed creating github arl: %v", err)
+	}
+
+	ch, err := a.Fetch()
+	if err != nil {
+		t.Errorf("failed fetching github arl: %v", err)
+	} else {
+		nContents := 0
+		for c := range ch {
+			if c.Error != nil {
+				t.Errorf("unexpected error fetching github arl: %v", c.Error)
+			}
+			if !strings.HasPrefix(c.FilePath, "limacharlie") {
+				t.Errorf("unexpected file outside of subdir: %s", c.FilePath)
+			}
+			nContents += 1
+		}
+		if nContents < 50 || nContents > 500 {
+			t.Errorf("unexpected number of resources: %d", nContents)
+		}
+	}
+}
+
+func TestGithubMaxSize(t *testing.T) {
+	// A tiny max size should abort the fetch with an error.
+	a, err := NewARL("[github,refractionPOINT/python-limacharlie]", 1024, 10)
+	if err != nil {
+		t.Errorf("failed creating github arl: %v", err)
+	}
+
+	ch, err := a.Fetch()
+	if err != nil {
+		t.Errorf("failed fetching github arl: %v", err)
+	} else {
+		isErrorSeen := false
+		for c := range ch {
+			if c.Error != nil {
+				isErrorSeen = true
+			}
+		}
+		if !isErrorSeen {
+			t.Error("max size exceeded but no error was produced")
 		}
 	}
 }

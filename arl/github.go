@@ -20,13 +20,18 @@
 package arl
 
 import (
+	"archive/tar"
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -53,7 +58,7 @@ func (a AuthenticatedResourceLocator) getGitHub() (chan Content, error) {
 func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 	// If the path in repo ends with "?ref=...", we extract the
 	// ref name we want to look for.
-	targetRef := plumbing.ReferenceName("")
+	targetBranch := ""
 	pathInRepo := ""
 	dest := a.methodDest
 	if strings.Contains(a.methodDest, "?ref=") {
@@ -62,7 +67,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 			return nil, errors.New("invalid github path")
 		}
 		dest = components[0]
-		targetRef = plumbing.ReferenceName(fmt.Sprintf("refs/heads/%s", components[1]))
+		targetBranch = components[1]
 	}
 
 	// Get the repo name itself. It's the first 2 components.
@@ -75,19 +80,28 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 		pathInRepo = strings.Join(components[2:], "/")
 	}
 
-	gitOptions := git.CloneOptions{
-		URL:           fmt.Sprintf("https://github.com/%s", repoPath),
-		ReferenceName: targetRef,
+	if a.authType == "" {
+		// Public repo: stream a tarball of the tree at HEAD instead of
+		// cloning, a clone materializes the full history in memory.
+		return a.getGitHubFromTarball(repoPath, pathInRepo, targetBranch)
 	}
 
-	if a.authType == "ssh" {
-		gitOptions.URL = fmt.Sprintf("git@github.com:%s", repoPath)
-		pubKey, err := ssh.NewPublicKeys("git", []byte(a.authData), "")
-		if err != nil {
-			return nil, fmt.Errorf("generate publickey failed: %v", err)
-		}
-		gitOptions.Auth = pubKey
+	gitOptions := git.CloneOptions{
+		URL: fmt.Sprintf("git@github.com:%s", repoPath),
+		// We only ever read the tree at the tip of one branch, a full
+		// clone would hold the entire history in memory.
+		Depth:        1,
+		SingleBranch: true,
 	}
+	if targetBranch != "" {
+		gitOptions.ReferenceName = plumbing.ReferenceName(fmt.Sprintf("refs/heads/%s", targetBranch))
+	}
+
+	pubKey, err := ssh.NewPublicKeys("git", []byte(a.authData), "")
+	if err != nil {
+		return nil, fmt.Errorf("generate publickey failed: %v", err)
+	}
+	gitOptions.Auth = pubKey
 
 	// Clone the repo in memory.
 	r, err := git.Clone(memory.NewStorage(), nil, &gitOptions)
@@ -117,15 +131,23 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 	chOut := make(chan Content, a.maxConcurrent)
 	go func() {
 		defer close(chOut)
-		tree.Files().ForEach(func(f *object.File) error {
+		totalSize := uint64(0)
+		err := tree.Files().ForEach(func(f *object.File) error {
 			if !strings.HasPrefix(f.Name, pathInRepo) {
 				return nil
+			}
+			if a.maxSize != 0 {
+				totalSize += uint64(f.Size)
+				if totalSize > a.maxSize {
+					return fmt.Errorf("maximum resource size reached (%d bytes)", a.maxSize)
+				}
 			}
 			reader, err := f.Blob.Reader()
 			if err != nil {
 				return fmt.Errorf("failed to get blob reader: %v", err)
 			}
 			data, err := ioutil.ReadAll(reader)
+			reader.Close()
 			if err != nil {
 				return fmt.Errorf("failed to read blob: %v", err)
 			}
@@ -135,6 +157,108 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 			}
 			return nil
 		})
+		if err != nil {
+			chOut <- Content{Error: err}
+		}
+	}()
+
+	return chOut, nil
+}
+
+// tarballFetchTimeout bounds the life of a tarball transfer so that an
+// abandoned consumer cannot pin the underlying connection forever.
+const tarballFetchTimeout = 30 * time.Minute
+
+// getGitHubFromTarball fetches the tree of a public GitHub repo at the tip of
+// a branch (or the default branch) as a streamed tarball. Unlike a git clone,
+// this holds at most one file in memory at a time and never fetches history.
+func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, pathInRepo string, targetBranch string) (chan Content, error) {
+	ref := "HEAD"
+	if targetBranch != "" {
+		ref = fmt.Sprintf("refs/heads/%s", targetBranch)
+	}
+	url := fmt.Sprintf("https://codeload.github.com/%s/tar.gz/%s", repoPath, ref)
+
+	ctx, cancel := context.WithTimeout(context.Background(), tarballFetchTimeout)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "AuthenticatedResourceLocator/Go")
+
+	client := a.httpClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to fetch repo tarball: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		resp.Body.Close()
+		cancel()
+		return nil, fmt.Errorf("failed to fetch repo tarball %s: %s", url, resp.Status)
+	}
+
+	gzReader, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		resp.Body.Close()
+		cancel()
+		return nil, fmt.Errorf("failed to read repo tarball: %v", err)
+	}
+
+	chOut := make(chan Content, a.maxConcurrent)
+	go func() {
+		defer close(chOut)
+		defer cancel()
+		defer resp.Body.Close()
+		defer gzReader.Close()
+
+		totalSize := uint64(0)
+		tarReader := tar.NewReader(gzReader)
+		for {
+			header, err := tarReader.Next()
+			if err == io.EOF {
+				return
+			}
+			if err != nil {
+				chOut <- Content{Error: fmt.Errorf("failed to read repo tarball: %v", err)}
+				return
+			}
+			// We only care about regular files.
+			if header.Typeflag != tar.TypeReg {
+				continue
+			}
+			// GitHub tarballs prefix every entry with a top level
+			// "repoName-ref/" directory, strip it to get the path in repo.
+			name := header.Name
+			idx := strings.Index(name, "/")
+			if idx < 0 {
+				continue
+			}
+			name = name[idx+1:]
+			if name == "" || !strings.HasPrefix(name, pathInRepo) {
+				continue
+			}
+			if a.maxSize != 0 {
+				totalSize += uint64(header.Size)
+				if totalSize > a.maxSize {
+					chOut <- Content{Error: fmt.Errorf("maximum resource size reached (%d bytes)", a.maxSize)}
+					return
+				}
+			}
+			data, err := io.ReadAll(tarReader)
+			if err != nil {
+				chOut <- Content{FilePath: name, Error: fmt.Errorf("failed to read %s from repo tarball: %v", name, err)}
+				return
+			}
+			chOut <- Content{
+				FilePath: name,
+				Data:     data,
+			}
+		}
 	}()
 
 	return chOut, nil
