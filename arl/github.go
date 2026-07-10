@@ -22,6 +22,7 @@ package arl
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -163,6 +165,10 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 	return chOut, nil
 }
 
+// tarballFetchTimeout bounds the life of a tarball transfer so that an
+// abandoned consumer cannot pin the underlying connection forever.
+const tarballFetchTimeout = 30 * time.Minute
+
 // getGitHubFromTarball fetches the tree of a public GitHub repo at the tip of
 // a branch (or the default branch) as a streamed tarball. Unlike a git clone,
 // this holds at most one file in memory at a time and never fetches history.
@@ -173,8 +179,10 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 	}
 	url := fmt.Sprintf("https://codeload.github.com/%s/tar.gz/%s", repoPath, ref)
 
-	req, err := http.NewRequest("GET", url, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), tarballFetchTimeout)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "AuthenticatedResourceLocator/Go")
@@ -185,22 +193,26 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("failed to fetch repo tarball: %v", err)
 	}
 	if resp.StatusCode != 200 {
 		resp.Body.Close()
+		cancel()
 		return nil, fmt.Errorf("failed to fetch repo tarball %s: %s", url, resp.Status)
 	}
 
 	gzReader, err := gzip.NewReader(resp.Body)
 	if err != nil {
 		resp.Body.Close()
+		cancel()
 		return nil, fmt.Errorf("failed to read repo tarball: %v", err)
 	}
 
 	chOut := make(chan Content, a.maxConcurrent)
 	go func() {
 		defer close(chOut)
+		defer cancel()
 		defer resp.Body.Close()
 		defer gzReader.Close()
 
