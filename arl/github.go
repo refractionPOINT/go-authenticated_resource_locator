@@ -103,8 +103,11 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 	}
 	gitOptions.Auth = pubKey
 
-	// Clone the repo in memory.
-	cloneCtx, cancelClone := context.WithTimeout(context.Background(), a.opts.timeoutOr(tarballFetchTimeout))
+	// The clone and the file iteration share one time budget, so the
+	// goroutine cannot outlive the fetch deadline by starting a second
+	// one after the clone.
+	deadline := time.Now().Add(a.opts.timeoutOr(tarballFetchTimeout))
+	cloneCtx, cancelClone := context.WithDeadline(context.Background(), deadline)
 	defer cancelClone()
 	r, err := git.CloneContext(cloneCtx, memory.NewStorage(), nil, &gitOptions)
 	if err != nil {
@@ -135,8 +138,9 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 		defer close(chOut)
 		// send gives up when the deadline passes so an abandoned
 		// consumer cannot pin the iteration (and the in-memory
-		// clone) forever.
-		sendCtx, cancelSends := context.WithTimeout(context.Background(), a.opts.timeoutOr(tarballFetchTimeout))
+		// clone) forever. The deadline is whatever is left of the
+		// budget already spent by the clone.
+		sendCtx, cancelSends := context.WithDeadline(context.Background(), deadline)
 		defer cancelSends()
 		send := func(c Content) error {
 			select {
