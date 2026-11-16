@@ -679,20 +679,34 @@ func TestTerminalErrorSurvivesAbandonedConsumer(t *testing.T) {
 	t.Cleanup(func() { abandonGrace = old })
 
 	z := makeZip(t, map[string][]byte{"one": []byte("1"), "two": []byte("2"), "three": []byte("3")})
-	ch := multiplexContent(Content{Data: z}, 1024*1024, time.Now().Add(50*time.Millisecond))
-	// Read nothing while the fetch runs and its grace period passes.
-	time.Sleep(1 * time.Second)
-	n := 0
+	out := make(chan Content, 1)
+	done := make(chan struct{})
+	go func() {
+		expandArchive(out, Content{Data: z}, 1024*1024, time.Now().Add(50*time.Millisecond))
+		close(done)
+	}()
+	// The consumer only starts reading once the expansion has run out of
+	// time, given up on it, and returned.
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("abandoned expansion did not give up")
+	}
 	var last Content
-	for c := range ch {
-		n++
-		last = c
+	select {
+	case last = <-out:
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal message not observable after the grace period")
+	}
+	// Only the terminal message is observable, the unread data entry
+	// made room for it.
+	select {
+	case c := <-out:
+		t.Fatalf("unexpected extra message: %+v", c)
+	default:
 	}
 	if !errors.Is(last.Error, context.DeadlineExceeded) {
-		t.Fatalf("late consumer saw %d messages, last error %v: terminal state lost", n, last.Error)
-	}
-	if n != 1 {
-		t.Errorf("expected only the terminal message to be observable, got %d", n)
+		t.Fatalf("terminal state lost, got: %v", last.Error)
 	}
 }
 
