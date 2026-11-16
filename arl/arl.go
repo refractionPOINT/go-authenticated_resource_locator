@@ -183,32 +183,31 @@ func (a *AuthenticatedResourceLocator) Fetch() (chan Content, error) {
 	return a.get()
 }
 
-// abandonGrace is how long a final (error) message waits for a consumer once
-// a fetch has run out of time; past that the consumer is considered gone.
+// ErrorIncompleteFetch reports a fetch that ended without delivering
+// everything: a consumer stopped reading, or a message had to be dropped.
+var ErrorIncompleteFetch = errors.New("fetch incomplete")
+
+// abandonGrace is how long the terminal message of a fetch waits for a
+// consumer once the fetch has run out of time; past that the consumer is
+// considered gone.
 var abandonGrace = 10 * time.Second
 
 // deliverFinal hands the last message of a producer to the consumer.
 // Unlike the regular sends it does not depend on the fetch deadline, which
 // may already have passed; the non-blocking attempt first, so a consumer
 // with room still gets the message even once the deadline has closed the
-// done channel. It reports whether the message was delivered: a dropped
-// message means the consumer is gone, so the fetch is incomplete.
-// If done is non-nil it also gives up when it closes: past the fetch
-// deadline the terminal delivery of the fetch takes over, so waiting the
-// full grace again would only extend the fetch's lifetime.
+// done channel. It then waits for the consumer as long as the fetch lives
+// (the done channel bounds the wait), and reports whether the message was
+// delivered: a dropped message means the fetch result is incomplete.
 func deliverFinal(out chan<- Content, c Content, done <-chan struct{}) bool {
 	select {
 	case out <- c:
 		return true
 	default:
 	}
-	t := time.NewTimer(abandonGrace)
-	defer t.Stop()
 	select {
 	case out <- c:
 		return true
-	case <-t.C:
-		return false
 	case <-done:
 		return false
 	}
@@ -242,7 +241,13 @@ func deliverTerminal(out chan Content, c Content) {
 }
 
 func incompleteError(ctx context.Context) error {
-	return fmt.Errorf("fetch incomplete: %w", ctx.Err())
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %w", ErrorIncompleteFetch, err)
+	}
+	// The fetch ended without its context being cancelled (for example
+	// a message was dropped while the consumer was slow): still
+	// incomplete, but no cause to wrap.
+	return ErrorIncompleteFetch
 }
 
 // multiplexContent expands tar and zip content into its files. The total

@@ -710,6 +710,23 @@ func TestTerminalErrorSurvivesAbandonedConsumer(t *testing.T) {
 	}
 }
 
+// The incomplete error always identifies itself, with or without a cause
+// from the context.
+func TestIncompleteError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	err := incompleteError(ctx)
+	if !errors.Is(err, ErrorIncompleteFetch) {
+		t.Errorf("missing sentinel: %v", err)
+	}
+	if got := err.Error(); strings.Contains(got, "%!w") {
+		t.Errorf("broken error text: %s", got)
+	}
+	cancel()
+	if !errors.Is(incompleteError(ctx), context.Canceled) {
+		t.Errorf("canceled cause lost: %v", incompleteError(ctx))
+	}
+}
+
 func TestSizeAndConcurrencyClamps(t *testing.T) {
 	// A pathological maxSize cannot push size arithmetic out of int64
 	// range, and a pathological maxConcurrent cannot spawn an
