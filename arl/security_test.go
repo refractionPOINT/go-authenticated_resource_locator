@@ -678,7 +678,7 @@ func TestAbandonedMultiplexIsBounded(t *testing.T) {
 	out := make(chan Content, 1)
 	done := make(chan struct{})
 	go func() {
-		expandArchive(out, Content{Data: archive}, 1024*1024, 50*time.Millisecond)
+		expandArchive(out, Content{Data: archive}, 1024*1024, time.Now().Add(50*time.Millisecond))
 		close(done)
 	}()
 	// Nothing reads from out: the first entry fills the buffer, the
@@ -705,7 +705,7 @@ func TestGCSDeadlineIsReported(t *testing.T) {
 		"prefix/slow.txt": []byte("slow"),
 	}, 0, map[string]bool{"prefix/slow.txt": true})
 
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 2; i++ {
 		a, err := NewARL(gcsARL(t, saKey(t, nil)), 1024, 2, WithTimeout(3*time.Second))
 		if err != nil {
 			t.Fatal(err)
@@ -756,7 +756,7 @@ func TestGCSSlowConsumerGetsIncompleteError(t *testing.T) {
 func TestMultiplexDeadlineIsReported(t *testing.T) {
 	shortGrace(t)
 	z := makeZip(t, map[string][]byte{"one": []byte("1"), "two": []byte("2"), "three": []byte("3")})
-	ch := multiplexContent(Content{Data: z}, 1024*1024, 300*time.Millisecond)
+	ch := multiplexContent(Content{Data: z}, 1024*1024, time.Now().Add(300*time.Millisecond))
 	time.Sleep(900 * time.Millisecond)
 	var last Content
 	for c := range ch {

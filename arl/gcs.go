@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/iterator"
@@ -89,7 +90,8 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), a.opts.timeoutOr(defaultGCSTimeout))
+	deadline := time.Now().Add(a.opts.timeoutOr(defaultGCSTimeout))
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	client, err := storage.NewClient(ctx,
 		option.WithAuthCredentialsJSON(option.ServiceAccount, keyJSON),
 		option.WithScopes(storage.ScopeReadOnly),
@@ -179,7 +181,7 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 				// If there was only one blob, we check if
 				// it's an archive and multiplex it.
 				if len(blobs) == 1 && out.Error == nil {
-					parts := multiplexContent(out, a.maxSize, a.opts.timeoutOr(defaultGCSTimeout))
+					parts := multiplexContent(out, a.maxSize, deadline)
 					for b := range parts {
 						if !send(b) {
 							go func() {

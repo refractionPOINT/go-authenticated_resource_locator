@@ -206,8 +206,9 @@ func incompleteError(ctx context.Context) error {
 
 // multiplexContent expands tar and zip content into its files. The total
 // expanded size is bounded by maxExpanded, and an abandoned consumer can
-// hold the expansion for at most deadline.
-func multiplexContent(c Content, maxExpanded uint64, deadline time.Duration) chan Content {
+// hold the expansion for at most the remaining time until deadline (plus
+// the grace period of the final message).
+func multiplexContent(c Content, maxExpanded uint64, deadline time.Time) chan Content {
 	out := make(chan Content, 1)
 
 	go func() {
@@ -220,9 +221,9 @@ func multiplexContent(c Content, maxExpanded uint64, deadline time.Duration) cha
 
 // expandArchive does the work of multiplexContent, returning once everything
 // was sent, the consumer was given up on, or the budget ran out.
-func expandArchive(out chan Content, c Content, maxExpanded uint64, deadline time.Duration) {
+func expandArchive(out chan Content, c Content, maxExpanded uint64, deadline time.Time) {
 	{
-		ctx, cancel := context.WithTimeout(context.Background(), deadline)
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
 		defer cancel()
 		// send gives up when the deadline passes so an abandoned
 		// consumer cannot pin the expansion forever.

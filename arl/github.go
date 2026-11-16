@@ -333,7 +333,8 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 		return nil, ErrorAuthNotImplemented
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), a.opts.timeoutOr(defaultHTTPTimeout))
+	deadline := time.Now().Add(a.opts.timeoutOr(defaultHTTPTimeout))
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	gh := &githubFetcher{ctx: ctx, client: a.httpClient, maxSize: a.maxSize, auth: authHeaders}
 
 	paths, err := gh.listFiles(fullURL, repoPath, repoParams)
@@ -354,7 +355,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 			FilePath: paths[0].Path,
 			Data:     data,
 		}
-		return multiplexContent(tmpContent, a.maxSize, a.opts.timeoutOr(defaultHTTPTimeout)), nil
+		return multiplexContent(tmpContent, a.maxSize, deadline), nil
 	}
 
 	chIn := make(chan githubFileRecord, len(paths))
