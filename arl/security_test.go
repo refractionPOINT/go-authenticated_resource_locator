@@ -666,6 +666,32 @@ func TestExpiredDeadlineDeliversToActiveConsumer(t *testing.T) {
 	}
 }
 
+// The terminal error must survive a consumer that only reads after the
+// grace period: a late reader can never mistake an incomplete fetch for
+// a complete one.
+func TestTerminalErrorSurvivesAbandonedConsumer(t *testing.T) {
+	old := abandonGrace
+	abandonGrace = 150 * time.Millisecond
+	t.Cleanup(func() { abandonGrace = old })
+
+	z := makeZip(t, map[string][]byte{"one": []byte("1"), "two": []byte("2"), "three": []byte("3")})
+	ch := multiplexContent(Content{Data: z}, 1024*1024, time.Now().Add(50*time.Millisecond))
+	// Read nothing while the fetch runs and its grace period passes.
+	time.Sleep(1 * time.Second)
+	n := 0
+	var last Content
+	for c := range ch {
+		n++
+		last = c
+	}
+	if !errors.Is(last.Error, context.DeadlineExceeded) {
+		t.Fatalf("late consumer saw %d messages, last error %v: terminal state lost", n, last.Error)
+	}
+	if n != 1 {
+		t.Errorf("expected only the terminal message to be observable, got %d", n)
+	}
+}
+
 func TestSizeAndConcurrencyClamps(t *testing.T) {
 	// A pathological maxSize cannot push size arithmetic out of int64
 	// range, and a pathological maxConcurrent cannot spawn an

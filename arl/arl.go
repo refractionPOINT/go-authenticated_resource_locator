@@ -187,17 +187,46 @@ func (a *AuthenticatedResourceLocator) Fetch() (chan Content, error) {
 // a fetch has run out of time; past that the consumer is considered gone.
 var abandonGrace = 10 * time.Second
 
-// deliverFinal hands the last message of a fetch to the consumer. Unlike the
-// regular sends it does not depend on the fetch deadline, which may already
-// have passed, so a failed or incomplete fetch is never mistaken for a
-// complete one. It only gives up on a consumer that has stopped reading.
-func deliverFinal(out chan<- Content, c Content) {
+// deliverFinal hands the last message of a producer to the consumer.
+// Unlike the regular sends it does not depend on the fetch deadline, which
+// may already have passed. It reports whether the message was delivered:
+// a dropped message means the consumer is gone, so the fetch is incomplete.
+func deliverFinal(out chan<- Content, c Content) bool {
 	t := time.NewTimer(abandonGrace)
 	defer t.Stop()
 	select {
 	case out <- c:
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
+// deliverTerminal hands the terminal message of a fetch to the consumer.
+// Like deliverFinal it waits for a consumer that may still arrive, but
+// unlike it the message is never dropped: a consumer that reads later must
+// never mistake a partial or empty fetch for a complete one. Once the grace
+// period passes it makes room for the terminal message by discarding an
+// unread buffered data message. The caller must only call it when no other
+// producer can send on out, and out must be buffered (all fetch channels
+// are), so the final send cannot block.
+func deliverTerminal(out chan Content, c Content) {
+	t := time.NewTimer(abandonGrace)
+	defer t.Stop()
+	select {
+	case out <- c:
+		return
 	case <-t.C:
 	}
+	// Nobody is reading. Drop an unread data message to make the
+	// terminal state observable to whoever reads later. The channel is
+	// buffered and we are the only remaining sender, so the send below
+	// always has room.
+	select {
+	case <-out:
+	default:
+	}
+	out <- c
 }
 
 func incompleteError(ctx context.Context) error {
@@ -279,7 +308,7 @@ func expandArchive(out chan Content, c Content, maxExpanded uint64, deadline tim
 				Data:     data,
 				Error:    err,
 			}) {
-				deliverFinal(out, Content{Error: incompleteError(ctx)})
+				deliverTerminal(out, Content{Error: incompleteError(ctx)})
 				return
 			}
 			if errors.Is(err, ErrorResourceTooLarge) {
@@ -292,7 +321,7 @@ func expandArchive(out chan Content, c Content, maxExpanded uint64, deadline tim
 			// So this was not a tar and not a zip, we'll just return
 			// the file as-is.
 			if !send(c) {
-				deliverFinal(out, Content{Error: incompleteError(ctx)})
+				deliverTerminal(out, Content{Error: incompleteError(ctx)})
 			}
 			return
 		}
@@ -309,7 +338,7 @@ func expandArchive(out chan Content, c Content, maxExpanded uint64, deadline tim
 				newFile.Error = err
 			}
 			if !send(newFile) {
-				deliverFinal(out, Content{Error: incompleteError(ctx)})
+				deliverTerminal(out, Content{Error: incompleteError(ctx)})
 				return
 			}
 			if errors.Is(newFile.Error, ErrorResourceTooLarge) {

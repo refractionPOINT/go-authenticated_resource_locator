@@ -134,7 +134,10 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 		blobs = append(blobs, attrs)
 	}
 
-	chOut := make(chan Content)
+	// The buffer gives the terminal message of the fetch room to be
+	// observable even when the consumer stops reading (see
+	// deliverTerminal).
+	chOut := make(chan Content, 1)
 	chIn := make(chan *storage.ObjectAttrs)
 	wg := sync.WaitGroup{}
 	downloaded := atomic.Uint64{}
@@ -222,7 +225,7 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 	go func() {
 		wg.Wait()
 		if incomplete.Load() {
-			deliverFinal(chOut, Content{Error: incompleteError(ctx)})
+			deliverTerminal(chOut, Content{Error: incompleteError(ctx)})
 		}
 		client.Close()
 		cancel()

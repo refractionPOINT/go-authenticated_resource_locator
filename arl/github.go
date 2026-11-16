@@ -181,7 +181,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 			})
 		})
 		if err != nil {
-			deliverFinal(chOut, Content{Error: err})
+			deliverTerminal(chOut, Content{Error: err})
 		}
 	}()
 
@@ -262,7 +262,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 				return
 			}
 			if err != nil {
-				deliverFinal(chOut, Content{Error: fmt.Errorf("failed to read repo tarball: %v", err)})
+				deliverTerminal(chOut, Content{Error: fmt.Errorf("failed to read repo tarball: %v", err)})
 				return
 			}
 			// We only care about regular files.
@@ -283,20 +283,20 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 			if a.maxSize != 0 {
 				totalSize += uint64(header.Size)
 				if totalSize > a.maxSize {
-					deliverFinal(chOut, Content{Error: fmt.Errorf("maximum resource size reached (%d bytes)", a.maxSize)})
+					deliverTerminal(chOut, Content{Error: fmt.Errorf("maximum resource size reached (%d bytes)", a.maxSize)})
 					return
 				}
 			}
 			data, err := readLimited(tarReader, a.maxSize)
 			if err != nil {
-				deliverFinal(chOut, Content{FilePath: name, Error: fmt.Errorf("failed to read %s from repo tarball: %v", name, err)})
+				deliverTerminal(chOut, Content{FilePath: name, Error: fmt.Errorf("failed to read %s from repo tarball: %v", name, err)})
 				return
 			}
 			if !send(Content{
 				FilePath: name,
 				Data:     data,
 			}) {
-				deliverFinal(chOut, Content{Error: incompleteError(ctx)})
+				deliverTerminal(chOut, Content{Error: incompleteError(ctx)})
 				return
 			}
 		}
@@ -395,7 +395,12 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 				data, err := gh.download(gr.DownloadURL)
 				if err != nil {
 					tmpContent.Error = err
-					deliverFinal(chOut, tmpContent)
+					// Not the terminal message of the fetch (other
+					// workers keep going), but if nobody takes it
+					// the fetch result is incomplete.
+					if !deliverFinal(chOut, tmpContent) {
+						incomplete.Store(true)
+					}
 					return
 				}
 				tmpContent.Data = data
@@ -419,7 +424,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 	go func() {
 		wg.Wait()
 		if incomplete.Load() {
-			deliverFinal(chOut, Content{Error: incompleteError(gh.ctx)})
+			deliverTerminal(chOut, Content{Error: incompleteError(gh.ctx)})
 		}
 		cancel()
 		close(chOut)
