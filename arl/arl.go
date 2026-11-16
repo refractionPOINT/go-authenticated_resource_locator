@@ -183,6 +183,27 @@ func (a *AuthenticatedResourceLocator) Fetch() (chan Content, error) {
 	return a.get()
 }
 
+// abandonGrace is how long a final (error) message waits for a consumer once
+// a fetch has run out of time; past that the consumer is considered gone.
+var abandonGrace = 10 * time.Second
+
+// deliverFinal hands the last message of a fetch to the consumer. Unlike the
+// regular sends it does not depend on the fetch deadline, which may already
+// have passed, so a failed or incomplete fetch is never mistaken for a
+// complete one. It only gives up on a consumer that has stopped reading.
+func deliverFinal(out chan<- Content, c Content) {
+	t := time.NewTimer(abandonGrace)
+	defer t.Stop()
+	select {
+	case out <- c:
+	case <-t.C:
+	}
+}
+
+func incompleteError(ctx context.Context) error {
+	return fmt.Errorf("fetch incomplete: %w", ctx.Err())
+}
+
 // multiplexContent expands tar and zip content into its files. The total
 // expanded size is bounded by maxExpanded, and an abandoned consumer can
 // hold the expansion for at most deadline.
@@ -240,6 +261,7 @@ func multiplexContent(c Content, maxExpanded uint64, deadline time.Duration) cha
 				Data:     data,
 				Error:    err,
 			}) {
+				deliverFinal(out, Content{Error: incompleteError(ctx)})
 				return
 			}
 			if errors.Is(err, ErrorResourceTooLarge) {
@@ -251,7 +273,9 @@ func multiplexContent(c Content, maxExpanded uint64, deadline time.Duration) cha
 		if err != nil {
 			// So this was not a tar and not a zip, we'll just return
 			// the file as-is.
-			send(c)
+			if !send(c) {
+				deliverFinal(out, Content{Error: incompleteError(ctx)})
+			}
 			return
 		}
 		for _, zipFile := range zipReader.File {
@@ -267,6 +291,7 @@ func multiplexContent(c Content, maxExpanded uint64, deadline time.Duration) cha
 				newFile.Error = err
 			}
 			if !send(newFile) {
+				deliverFinal(out, Content{Error: incompleteError(ctx)})
 				return
 			}
 			if errors.Is(newFile.Error, ErrorResourceTooLarge) {

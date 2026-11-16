@@ -22,6 +22,7 @@ package arl
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -249,6 +250,13 @@ func TestSanitizeServiceAccountKey(t *testing.T) {
 // client's emulator mode) to exercise listing and downloading.
 func fakeGCS(t *testing.T, objects map[string][]byte, listStatus int) {
 	t.Helper()
+	fakeGCSStalling(t, objects, listStatus, nil)
+}
+
+// fakeGCSStalling is fakeGCS where downloads of the named objects never
+// complete.
+func fakeGCSStalling(t *testing.T, objects map[string][]byte, listStatus int, stall map[string]bool) {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if listStatus != 0 && strings.HasSuffix(r.URL.Path, "/o") {
 			http.Error(w, `{"error":{"code":403,"message":"forbidden"}}`, listStatus)
@@ -264,6 +272,12 @@ func fakeGCS(t *testing.T, objects map[string][]byte, listStatus int) {
 		}
 		for n, d := range objects {
 			if strings.HasSuffix(r.URL.Path, "/"+n) {
+				if stall[n] {
+					w.Write(d[:1])
+					w.(http.Flusher).Flush()
+					<-r.Context().Done()
+					return
+				}
 				w.Write(d)
 				return
 			}
@@ -671,5 +685,126 @@ func TestAbandonedMultiplexIsBounded(t *testing.T) {
 		case <-expired:
 			t.Fatal("abandoned multiplex did not give up after its deadline")
 		}
+	}
+}
+
+func shortGrace(t *testing.T) {
+	old := abandonGrace
+	abandonGrace = 5 * time.Second
+	t.Cleanup(func() { abandonGrace = old })
+}
+
+// A fetch that runs out of time must say so: closing the channel normally
+// would look like a complete (possibly empty) result.
+func TestGCSDeadlineIsReported(t *testing.T) {
+	shortGrace(t)
+	fakeGCSStalling(t, map[string][]byte{
+		"prefix/fast.txt": []byte("fast"),
+		"prefix/slow.txt": []byte("slow"),
+	}, 0, map[string]bool{"prefix/slow.txt": true})
+
+	for i := 0; i < 8; i++ {
+		a, err := NewARL(gcsARL(t, saKey(t, nil)), 1024, 2, WithTimeout(400*time.Millisecond))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := a.Fetch()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sawError, sawFast := false, false
+		for c := range ch {
+			if c.Error != nil {
+				sawError = true
+			} else if c.FilePath == "gcs://some-bucket/prefix/fast.txt" {
+				sawFast = true
+			}
+		}
+		if !sawError {
+			t.Fatalf("attempt %d: stalled download closed the channel without an error", i)
+		}
+		if !sawFast {
+			t.Fatalf("attempt %d: completed object was not delivered", i)
+		}
+	}
+}
+
+func TestGCSSlowConsumerGetsIncompleteError(t *testing.T) {
+	shortGrace(t)
+	fakeGCS(t, map[string][]byte{"prefix/a.txt": []byte("a"), "prefix/b.txt": []byte("b")}, 0)
+	a, err := NewARL(gcsARL(t, saKey(t, nil)), 1024, 1, WithTimeout(500*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := a.Fetch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Not reading until after the deadline.
+	time.Sleep(1200 * time.Millisecond)
+	var last Content
+	for c := range ch {
+		last = c
+	}
+	if !errors.Is(last.Error, context.DeadlineExceeded) {
+		t.Errorf("expected the last message to report the deadline, got %v", last.Error)
+	}
+}
+
+func TestMultiplexDeadlineIsReported(t *testing.T) {
+	shortGrace(t)
+	z := makeZip(t, map[string][]byte{"one": []byte("1"), "two": []byte("2"), "three": []byte("3")})
+	ch := multiplexContent(Content{Data: z}, 1024*1024, 300*time.Millisecond)
+	time.Sleep(900 * time.Millisecond)
+	var last Content
+	for c := range ch {
+		last = c
+	}
+	if !errors.Is(last.Error, context.DeadlineExceeded) {
+		t.Errorf("expected the last message to report the deadline, got %v", last.Error)
+	}
+}
+
+// net/http rebuilds the request headers of every hop from the original
+// request, the key must stay out of all hops that leave the original host.
+func TestOTXKeyNotForwardedOnLaterHops(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.2:0")
+	if err != nil {
+		t.Skipf("cannot bind 127.0.0.2: %v", err)
+	}
+	seen := make(chan string, 4)
+	other := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.URL.Path + "=" + r.Header.Get("X-OTX-API-KEY")
+		if r.URL.Path == "/hop1" {
+			http.Redirect(w, r, "/hop2", http.StatusFound)
+			return
+		}
+		w.Write([]byte("ok"))
+	}))
+	other.Listener.Close()
+	other.Listener = l
+	other.Start()
+	defer other.Close()
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/hop1", http.StatusFound)
+	}))
+	defer first.Close()
+
+	a, _ := NewARL("[http,"+first.Listener.Addr().String()+"/x,otx,k]", 1024, 2, WithAllowedNetworks(netip.MustParsePrefix("127.0.0.0/24")))
+	ch, err := a.Fetch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(ch)
+	close(seen)
+	n := 0
+	for s := range seen {
+		n++
+		if !strings.HasSuffix(s, "=") {
+			t.Errorf("api key forwarded to another host: %s", s)
+		}
+	}
+	if n != 2 {
+		t.Errorf("expected 2 requests to the other host, got %d", n)
 	}
 }

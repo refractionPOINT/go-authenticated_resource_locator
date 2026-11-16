@@ -139,11 +139,15 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 
 	// send gives up when the deadline passes so an abandoned consumer
 	// cannot pin the workers forever.
+	// A dropped message means the fetch is incomplete, which is reported
+	// to the consumer before the channel is closed.
+	incomplete := atomic.Bool{}
 	send := func(c Content) bool {
 		select {
 		case chOut <- c:
 			return true
 		case <-ctx.Done():
+			incomplete.Store(true)
 			return false
 		}
 	}
@@ -200,6 +204,7 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 			select {
 			case chIn <- b:
 			case <-ctx.Done():
+				incomplete.Store(true)
 				return
 			}
 		}
@@ -207,6 +212,9 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 
 	go func() {
 		wg.Wait()
+		if incomplete.Load() {
+			deliverFinal(chOut, Content{Error: incompleteError(ctx)})
+		}
 		client.Close()
 		cancel()
 		close(chOut)

@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-git/go-git/v5"
@@ -171,8 +172,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 			})
 		})
 		if err != nil {
-			// The consumer may be gone, don't block on the way out.
-			send(Content{Error: err})
+			deliverFinal(chOut, Content{Error: err})
 		}
 	}()
 
@@ -245,7 +245,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 				return
 			}
 			if err != nil {
-				send(Content{Error: fmt.Errorf("failed to read repo tarball: %v", err)})
+				deliverFinal(chOut, Content{Error: fmt.Errorf("failed to read repo tarball: %v", err)})
 				return
 			}
 			// We only care about regular files.
@@ -266,19 +266,20 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 			if a.maxSize != 0 {
 				totalSize += uint64(header.Size)
 				if totalSize > a.maxSize {
-					send(Content{Error: fmt.Errorf("maximum resource size reached (%d bytes)", a.maxSize)})
+					deliverFinal(chOut, Content{Error: fmt.Errorf("maximum resource size reached (%d bytes)", a.maxSize)})
 					return
 				}
 			}
 			data, err := readLimited(tarReader, a.maxSize)
 			if err != nil {
-				send(Content{FilePath: name, Error: fmt.Errorf("failed to read %s from repo tarball: %v", name, err)})
+				deliverFinal(chOut, Content{FilePath: name, Error: fmt.Errorf("failed to read %s from repo tarball: %v", name, err)})
 				return
 			}
 			if !send(Content{
 				FilePath: name,
 				Data:     data,
 			}) {
+				deliverFinal(chOut, Content{Error: incompleteError(ctx)})
 				return
 			}
 		}
@@ -361,6 +362,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 
 	chOut := make(chan Content, a.maxConcurrent)
 	wg := sync.WaitGroup{}
+	incomplete := atomic.Bool{}
 
 	for i := 0; uint64(i) < a.maxConcurrent; i++ {
 		wg.Add(1)
@@ -375,16 +377,14 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 				data, err := gh.download(gr.DownloadURL)
 				if err != nil {
 					tmpContent.Error = err
-					select {
-					case chOut <- tmpContent:
-					case <-gh.ctx.Done():
-					}
+					deliverFinal(chOut, tmpContent)
 					return
 				}
 				tmpContent.Data = data
 				select {
 				case chOut <- tmpContent:
 				case <-gh.ctx.Done():
+					incomplete.Store(true)
 					return
 				}
 			}
@@ -393,6 +393,9 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 
 	go func() {
 		wg.Wait()
+		if incomplete.Load() {
+			deliverFinal(chOut, Content{Error: incompleteError(gh.ctx)})
+		}
 		cancel()
 		close(chOut)
 	}()

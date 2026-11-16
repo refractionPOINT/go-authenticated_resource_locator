@@ -142,7 +142,10 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	if prev.URL.Scheme == "https" && req.URL.Scheme != "https" {
 		return ErrorInsecureRedirect
 	}
-	if prev.URL.Host != req.URL.Host {
+	// net/http rebuilds the headers of every hop from the original request,
+	// so the key must be dropped on every hop leaving the original host,
+	// not only the first.
+	if via[0].URL.Host != req.URL.Host {
 		req.Header.Del("X-OTX-API-KEY")
 	}
 	return nil
