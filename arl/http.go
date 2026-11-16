@@ -82,7 +82,7 @@ func (a AuthenticatedResourceLocator) getHTTP() (chan Content, error) {
 		Data:     b,
 	}
 
-	return multiplexContent(bodyContent, a.maxSize), nil
+	return multiplexContent(bodyContent, a.maxSize, a.opts.timeoutOr(defaultHTTPTimeout)), nil
 }
 
 // readLimited reads at most max bytes, and fails if there is more.

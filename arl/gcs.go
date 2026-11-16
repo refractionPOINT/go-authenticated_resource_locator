@@ -175,7 +175,7 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 				// If there was only one blob, we check if
 				// it's an archive and multiplex it.
 				if len(blobs) == 1 && out.Error == nil {
-					parts := multiplexContent(out, a.maxSize)
+					parts := multiplexContent(out, a.maxSize, a.opts.timeoutOr(defaultGCSTimeout))
 					for b := range parts {
 						if !send(b) {
 							go func() {

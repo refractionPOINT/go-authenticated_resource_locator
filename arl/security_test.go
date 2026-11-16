@@ -30,6 +30,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -601,7 +602,7 @@ func TestIsBlockedAddr(t *testing.T) {
 		"100.64.0.1", "100.127.255.255", "224.0.0.1", "255.255.255.255", "240.0.0.1",
 		"::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:10.0.0.1",
 		"64:ff9b::a9fe:a9fe", "64:ff9b::7f00:1", "2002:a9fe:a9fe::1", "2002:7f00:1::1",
-		"198.18.0.1", "2001::1",
+		"198.18.0.1", "2001::1", "192.88.99.1", "2001:2::1", "2001:10::1",
 	}
 	for _, s := range blocked {
 		if !isBlockedAddr(netip.MustParseAddr(s)) {
@@ -622,4 +623,53 @@ func TestIsBlockedAddr(t *testing.T) {
 
 func writeFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0600)
+}
+
+func TestSizeAndConcurrencyClamps(t *testing.T) {
+	// A pathological maxSize cannot push size arithmetic out of int64
+	// range, and a pathological maxConcurrent cannot spawn an
+	// unbounded number of workers.
+	a, err := NewARL("[https,example.com/x]", 1<<62, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.maxSize > uint64(math.MaxInt64/2) {
+		t.Errorf("maxSize not clamped: %d", a.maxSize)
+	}
+	if a.maxConcurrent > maxConcurrentLimit {
+		t.Errorf("maxConcurrent not clamped: %d", a.maxConcurrent)
+	}
+
+	// Zero values select generous defaults, never unbounded fetches.
+	a, err = NewARL("[https,example.com/x]", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.maxSize != defaultMaxSize {
+		t.Errorf("default maxSize = %d, want %d", a.maxSize, defaultMaxSize)
+	}
+	if a.maxConcurrent != 1 {
+		t.Errorf("default maxConcurrent = %d, want 1", a.maxConcurrent)
+	}
+}
+
+func TestAbandonedMultiplexIsBounded(t *testing.T) {
+	// A consumer that walks away mid-expansion holds the expansion
+	// goroutine for at most the deadline.
+	archive := makeZip(t, map[string][]byte{"a": []byte("aa"), "b": []byte("bb")})
+	ch := multiplexContent(Content{Data: archive}, 1024*1024, 50*time.Millisecond)
+	// Read nothing: the expansion blocks on the second entry.
+	expired := time.After(10 * time.Second)
+	for {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				// The channel closed even though we never
+				// drained it.
+				return
+			}
+		case <-expired:
+			t.Fatal("abandoned multiplex did not give up after its deadline")
+		}
+	}
 }

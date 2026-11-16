@@ -132,6 +132,19 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 	chOut := make(chan Content, a.maxConcurrent)
 	go func() {
 		defer close(chOut)
+		// send gives up when the deadline passes so an abandoned
+		// consumer cannot pin the iteration (and the in-memory
+		// clone) forever.
+		sendCtx, cancelSends := context.WithTimeout(context.Background(), a.opts.timeoutOr(tarballFetchTimeout))
+		defer cancelSends()
+		send := func(c Content) error {
+			select {
+			case chOut <- c:
+				return nil
+			case <-sendCtx.Done():
+				return sendCtx.Err()
+			}
+		}
 		totalSize := uint64(0)
 		err := tree.Files().ForEach(func(f *object.File) error {
 			if !strings.HasPrefix(f.Name, pathInRepo) {
@@ -152,14 +165,14 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 			if err != nil {
 				return fmt.Errorf("failed to read blob: %v", err)
 			}
-			chOut <- Content{
+			return send(Content{
 				FilePath: f.Name,
 				Data:     data,
-			}
-			return nil
+			})
 		})
 		if err != nil {
-			chOut <- Content{Error: err}
+			// The consumer may be gone, don't block on the way out.
+			send(Content{Error: err})
 		}
 	}()
 
@@ -213,6 +226,17 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 		defer resp.Body.Close()
 		defer gzReader.Close()
 
+		// send gives up when the deadline passes so an abandoned
+		// consumer cannot pin the transfer forever.
+		send := func(c Content) bool {
+			select {
+			case chOut <- c:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+
 		totalSize := uint64(0)
 		tarReader := tar.NewReader(gzReader)
 		for {
@@ -221,7 +245,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 				return
 			}
 			if err != nil {
-				chOut <- Content{Error: fmt.Errorf("failed to read repo tarball: %v", err)}
+				send(Content{Error: fmt.Errorf("failed to read repo tarball: %v", err)})
 				return
 			}
 			// We only care about regular files.
@@ -242,18 +266,20 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 			if a.maxSize != 0 {
 				totalSize += uint64(header.Size)
 				if totalSize > a.maxSize {
-					chOut <- Content{Error: fmt.Errorf("maximum resource size reached (%d bytes)", a.maxSize)}
+					send(Content{Error: fmt.Errorf("maximum resource size reached (%d bytes)", a.maxSize)})
 					return
 				}
 			}
 			data, err := readLimited(tarReader, a.maxSize)
 			if err != nil {
-				chOut <- Content{FilePath: name, Error: fmt.Errorf("failed to read %s from repo tarball: %v", name, err)}
+				send(Content{FilePath: name, Error: fmt.Errorf("failed to read %s from repo tarball: %v", name, err)})
 				return
 			}
-			chOut <- Content{
+			if !send(Content{
 				FilePath: name,
 				Data:     data,
+			}) {
+				return
 			}
 		}
 	}()
@@ -323,7 +349,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 			FilePath: paths[0].Path,
 			Data:     data,
 		}
-		return multiplexContent(tmpContent, a.maxSize), nil
+		return multiplexContent(tmpContent, a.maxSize, a.opts.timeoutOr(defaultHTTPTimeout)), nil
 	}
 
 	chIn := make(chan githubFileRecord, len(paths))
@@ -349,11 +375,18 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 				data, err := gh.download(gr.DownloadURL)
 				if err != nil {
 					tmpContent.Error = err
-					chOut <- tmpContent
+					select {
+					case chOut <- tmpContent:
+					case <-gh.ctx.Done():
+					}
 					return
 				}
 				tmpContent.Data = data
-				chOut <- tmpContent
+				select {
+				case chOut <- tmpContent:
+				case <-gh.ctx.Done():
+					return
+				}
 			}
 		}()
 	}

@@ -23,12 +23,14 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type AuthenticatedResourceLocator struct {
@@ -102,6 +104,9 @@ func NewARLWithClient(arl string, maxSize uint64, maxConcurrent uint64, client *
 	if maxConcurrent == 0 {
 		maxConcurrent = 1
 	}
+	// Keep a pathological value from spawning an unbounded number of
+	// concurrent fetch workers.
+	maxConcurrent = min(maxConcurrent, maxConcurrentLimit)
 	a := AuthenticatedResourceLocator{
 		arl:           arl,
 		maxSize:       maxSize,
@@ -179,12 +184,26 @@ func (a *AuthenticatedResourceLocator) Fetch() (chan Content, error) {
 }
 
 // multiplexContent expands tar and zip content into its files. The total
-// expanded size is bounded by maxExpanded.
-func multiplexContent(c Content, maxExpanded uint64) chan Content {
+// expanded size is bounded by maxExpanded, and an abandoned consumer can
+// hold the expansion for at most deadline.
+func multiplexContent(c Content, maxExpanded uint64, deadline time.Duration) chan Content {
 	out := make(chan Content, 1)
 
 	go func() {
 		defer close(out)
+
+		ctx, cancel := context.WithTimeout(context.Background(), deadline)
+		defer cancel()
+		// send gives up when the deadline passes so an abandoned
+		// consumer cannot pin the expansion forever.
+		send := func(c Content) bool {
+			select {
+			case out <- c:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
 
 		remaining := maxExpanded
 		// take reads one entry within the remaining budget.
@@ -216,10 +235,12 @@ func multiplexContent(c Content, maxExpanded uint64) chan Content {
 				continue
 			}
 			data, err := take(tarReader)
-			out <- Content{
+			if !send(Content{
 				FilePath: fmt.Sprintf("/%s", header.Name),
 				Data:     data,
 				Error:    err,
+			}) {
+				return
 			}
 			if errors.Is(err, ErrorResourceTooLarge) {
 				return
@@ -230,7 +251,7 @@ func multiplexContent(c Content, maxExpanded uint64) chan Content {
 		if err != nil {
 			// So this was not a tar and not a zip, we'll just return
 			// the file as-is.
-			out <- c
+			send(c)
 			return
 		}
 		for _, zipFile := range zipReader.File {
@@ -245,7 +266,9 @@ func multiplexContent(c Content, maxExpanded uint64) chan Content {
 				f.Close()
 				newFile.Error = err
 			}
-			out <- newFile
+			if !send(newFile) {
+				return
+			}
 			if errors.Is(newFile.Error, ErrorResourceTooLarge) {
 				return
 			}

@@ -37,6 +37,10 @@ const (
 	// maxListedObjects bounds how many objects a single gcs prefix may
 	// expand to.
 	maxListedObjects = 100000
+
+	// maxConcurrentLimit bounds the number of concurrent fetch workers
+	// a single ARL may spawn, however large a caller passes.
+	maxConcurrentLimit = 1024
 )
 
 type options struct {
