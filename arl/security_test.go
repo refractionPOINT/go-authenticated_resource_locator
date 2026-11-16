@@ -616,7 +616,7 @@ func TestIsBlockedAddr(t *testing.T) {
 		"100.64.0.1", "100.127.255.255", "224.0.0.1", "255.255.255.255", "240.0.0.1",
 		"::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:10.0.0.1",
 		"64:ff9b::a9fe:a9fe", "64:ff9b::7f00:1", "2002:a9fe:a9fe::1", "2002:7f00:1::1",
-		"198.18.0.1", "2001::1", "192.88.99.1", "2001:2::1", "2001:10::1",
+		"198.18.0.1", "2001::1", "2001:20::1", "192.88.99.1", "192.88.99.1", "2001:2::1", "2001:10::1",
 	}
 	for _, s := range blocked {
 		if !isBlockedAddr(netip.MustParseAddr(s)) {
@@ -668,23 +668,25 @@ func TestSizeAndConcurrencyClamps(t *testing.T) {
 }
 
 func TestAbandonedMultiplexIsBounded(t *testing.T) {
-	// A consumer that walks away mid-expansion holds the expansion
-	// goroutine for at most the deadline.
-	archive := makeZip(t, map[string][]byte{"a": []byte("aa"), "b": []byte("bb")})
-	ch := multiplexContent(Content{Data: archive}, 1024*1024, 50*time.Millisecond)
-	// Read nothing: the expansion blocks on the second entry.
-	expired := time.After(10 * time.Second)
-	for {
-		select {
-		case _, ok := <-ch:
-			if !ok {
-				// The channel closed even though we never
-				// drained it.
-				return
-			}
-		case <-expired:
-			t.Fatal("abandoned multiplex did not give up after its deadline")
-		}
+	// A consumer that never reads holds the expansion for at most the
+	// deadline plus the grace period for the final message.
+	old := abandonGrace
+	abandonGrace = 200 * time.Millisecond
+	defer func() { abandonGrace = old }()
+
+	archive := makeZip(t, map[string][]byte{"a": []byte("aa"), "b": []byte("bb"), "c": []byte("cc")})
+	out := make(chan Content, 1)
+	done := make(chan struct{})
+	go func() {
+		expandArchive(out, Content{Data: archive}, 1024*1024, 50*time.Millisecond)
+		close(done)
+	}()
+	// Nothing reads from out: the first entry fills the buffer, the
+	// second blocks.
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("abandoned expansion did not give up")
 	}
 }
 

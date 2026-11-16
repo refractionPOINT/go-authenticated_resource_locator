@@ -43,6 +43,7 @@ var blockedPrefixes = mustPrefixes(
 	"2001::/32",       // Teredo
 	"2001:2::/48",     // benchmarking
 	"2001:10::/28",    // ORCHID (deprecated)
+	"2001:20::/28",    // ORCHIDv2
 	"2001:db8::/32",   // documentation
 	"fec0::/10",       // deprecated site-local
 )

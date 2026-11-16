@@ -212,7 +212,16 @@ func multiplexContent(c Content, maxExpanded uint64, deadline time.Duration) cha
 
 	go func() {
 		defer close(out)
+		expandArchive(out, c, maxExpanded, deadline)
+	}()
 
+	return out
+}
+
+// expandArchive does the work of multiplexContent, returning once everything
+// was sent, the consumer was given up on, or the budget ran out.
+func expandArchive(out chan Content, c Content, maxExpanded uint64, deadline time.Duration) {
+	{
 		ctx, cancel := context.WithTimeout(context.Background(), deadline)
 		defer cancel()
 		// send gives up when the deadline passes so an abandoned
@@ -298,7 +307,5 @@ func multiplexContent(c Content, maxExpanded uint64, deadline time.Duration) cha
 				return
 			}
 		}
-	}()
-
-	return out
+	}
 }
