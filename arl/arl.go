@@ -193,12 +193,12 @@ var ErrorIncompleteFetch = errors.New("fetch incomplete")
 var abandonGrace = 10 * time.Second
 
 // deliverFinal hands the last message of a producer to the consumer.
-// Unlike the regular sends it does not depend on the fetch deadline, which
-// may already have passed; the non-blocking attempt first, so a consumer
-// with room still gets the message even once the deadline has closed the
-// done channel. It then waits for the consumer as long as the fetch lives
-// (the done channel bounds the wait), and reports whether the message was
-// delivered: a dropped message means the fetch result is incomplete.
+// The non-blocking attempt comes first, so a consumer with room gets the
+// message immediately, even once the deadline has closed the done
+// channel. It then waits for the consumer as long as the fetch lives
+// (the done channel, i.e. the fetch deadline, bounds the wait), and
+// reports whether the message was delivered: a dropped message means
+// the fetch result is incomplete.
 func deliverFinal(out chan<- Content, c Content, done <-chan struct{}) bool {
 	select {
 	case out <- c:
