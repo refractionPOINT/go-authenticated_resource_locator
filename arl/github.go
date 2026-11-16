@@ -27,7 +27,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strings"
 	"sync"
@@ -104,7 +103,9 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 	gitOptions.Auth = pubKey
 
 	// Clone the repo in memory.
-	r, err := git.Clone(memory.NewStorage(), nil, &gitOptions)
+	cloneCtx, cancelClone := context.WithTimeout(context.Background(), a.opts.timeoutOr(tarballFetchTimeout))
+	defer cancelClone()
+	r, err := git.CloneContext(cloneCtx, memory.NewStorage(), nil, &gitOptions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to clone repo: %v", err)
 	}
@@ -146,7 +147,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 			if err != nil {
 				return fmt.Errorf("failed to get blob reader: %v", err)
 			}
-			data, err := ioutil.ReadAll(reader)
+			data, err := readLimited(reader, a.maxSize)
 			reader.Close()
 			if err != nil {
 				return fmt.Errorf("failed to read blob: %v", err)
@@ -179,7 +180,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 	}
 	url := fmt.Sprintf("https://codeload.github.com/%s/tar.gz/%s", repoPath, ref)
 
-	ctx, cancel := context.WithTimeout(context.Background(), tarballFetchTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), a.opts.timeoutOr(tarballFetchTimeout))
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		cancel()
@@ -187,11 +188,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 	}
 	req.Header.Set("User-Agent", "AuthenticatedResourceLocator/Go")
 
-	client := a.httpClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
+	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("failed to fetch repo tarball: %v", err)
@@ -249,7 +246,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 					return
 				}
 			}
-			data, err := io.ReadAll(tarReader)
+			data, err := readLimited(tarReader, a.maxSize)
 			if err != nil {
 				chOut <- Content{FilePath: name, Error: fmt.Errorf("failed to read %s from repo tarball: %v", name, err)}
 				return
@@ -305,15 +302,20 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 		return nil, ErrorAuthNotImplemented
 	}
 
-	paths, err := listGithubFiles(a.maxSize, fullURL, authHeaders, repoPath, repoParams)
+	ctx, cancel := context.WithTimeout(context.Background(), a.opts.timeoutOr(defaultHTTPTimeout))
+	gh := &githubFetcher{ctx: ctx, client: a.httpClient, maxSize: a.maxSize, auth: authHeaders}
+
+	paths, err := gh.listFiles(fullURL, repoPath, repoParams)
 
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
 	// If we have a single content, multiplex it.
 	if len(paths) == 1 {
-		data, err := downloadGithubFile(paths[0].DownloadURL, authHeaders)
+		defer cancel()
+		data, err := gh.download(paths[0].DownloadURL)
 		if err != nil {
 			return nil, err
 		}
@@ -321,7 +323,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 			FilePath: paths[0].Path,
 			Data:     data,
 		}
-		return multiplexContent(tmpContent), nil
+		return multiplexContent(tmpContent, a.maxSize), nil
 	}
 
 	chIn := make(chan githubFileRecord, len(paths))
@@ -344,7 +346,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 				tmpContent := Content{
 					FilePath: gr.Path,
 				}
-				data, err := downloadGithubFile(gr.DownloadURL, authHeaders)
+				data, err := gh.download(gr.DownloadURL)
 				if err != nil {
 					tmpContent.Error = err
 					chOut <- tmpContent
@@ -358,18 +360,29 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 
 	go func() {
 		wg.Wait()
+		cancel()
 		close(chOut)
 	}()
 
 	return chOut, nil
 }
 
-func listGithubFiles(maxSize uint64, baseURL string, auth http.Header, subPath string, repoParams string) ([]githubFileRecord, error) {
+// githubFetcher holds the shared state of the REST API calls of one fetch.
+type githubFetcher struct {
+	ctx     context.Context
+	client  *http.Client
+	maxSize uint64
+	auth    http.Header
+
+	// totalListed is the sum of the file sizes found while listing.
+	totalListed uint64
+}
+
+func (g *githubFetcher) listFiles(baseURL string, subPath string, repoParams string) ([]githubFileRecord, error) {
 	outPaths := []githubFileRecord{}
 
 	thisURL := fmt.Sprintf("%s%s%s", baseURL, subPath, repoParams)
-	fmt.Println(thisURL)
-	body, err := downloadGithubFile(thisURL, auth)
+	body, err := g.download(thisURL)
 	if err != nil {
 		return outPaths, err
 	}
@@ -410,7 +423,7 @@ func listGithubFiles(maxSize uint64, baseURL string, auth http.Header, subPath s
 				return outPaths, errors.New("github data missing path")
 			}
 
-			subPaths, err := listGithubFiles(maxSize, baseURL, auth, thisPath, repoParams)
+			subPaths, err := g.listFiles(baseURL, thisPath, repoParams)
 			outPaths = append(outPaths, subPaths...)
 			if err != nil {
 				return outPaths, err
@@ -441,8 +454,12 @@ func listGithubFiles(maxSize uint64, baseURL string, auth http.Header, subPath s
 			}
 
 			if entrySize != 0 {
-				if maxSize != 0 && uint64(entrySize) > maxSize {
-					return outPaths, errors.New("Maximum resurce size reached.")
+				if entrySize < 0 || uint64(entrySize) > g.maxSize {
+					return outPaths, ErrorResourceTooLarge
+				}
+				g.totalListed += uint64(entrySize)
+				if g.totalListed > g.maxSize {
+					return outPaths, ErrorResourceTooLarge
 				}
 				outPaths = append(outPaths, githubFileRecord{
 					Path:        thisPath,
@@ -455,37 +472,33 @@ func listGithubFiles(maxSize uint64, baseURL string, auth http.Header, subPath s
 	return outPaths, nil
 }
 
-func downloadGithubFile(url string, auth http.Header) ([]byte, error) {
-	data := []byte{}
+func (g *githubFetcher) download(url string) ([]byte, error) {
+	if !strings.HasPrefix(url, "https://") {
+		return nil, fmt.Errorf("refusing non https github url: %s", url)
+	}
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(g.ctx, "GET", url, nil)
 	if err != nil {
-		return data, err
+		return nil, err
 	}
 
 	// Copy the headers since they're not thread safe.
 	headers := http.Header{}
-	for k, v := range auth {
+	for k, v := range g.auth {
 		headers[k] = v
 	}
 	req.Header = headers
 	req.Header.Set("User-Agent", "AuthenticatedResourceLocator/Go")
 
-	client := http.Client{}
-
-	resp, err := client.Do(req)
+	resp, err := g.client.Do(req)
 	if err != nil {
-		return data, err
+		return nil, err
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return data, fmt.Errorf("failed to get resource %s: %s", url, resp.Status)
+		return nil, fmt.Errorf("failed to get resource %s: %s", url, resp.Status)
 	}
 
-	data, err = ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return data, err
-	}
-
-	return data, nil
+	return readLimited(resp.Body, g.maxSize)
 }

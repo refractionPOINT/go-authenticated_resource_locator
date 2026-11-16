@@ -3,8 +3,8 @@
 // REFRACTION POINT CONFIDENTIAL
 // __________________
 //
-//  Copyright 2018 Refraction Point Inc.
-//  All Rights Reserved.
+//	Copyright 2018 Refraction Point Inc.
+//	All Rights Reserved.
 //
 // NOTICE:  All information contained herein is, and remains
 // the property of Refraction Point Inc. and its suppliers,
@@ -15,14 +15,13 @@
 // Dissemination of this information or reproduction of this material
 // is strictly forbidden unless prior written permission is obtained
 // from Refraction Point Inc.
-//
-
 package arl
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strings"
 )
@@ -37,7 +36,11 @@ func (a AuthenticatedResourceLocator) getHTTP() (chan Content, error) {
 		return nil, ErrorMethodNotImplemented
 	}
 
-	req, err := http.NewRequest("GET", fullURL, nil)
+	// The context bounds the whole transfer, including the body.
+	ctx, cancel := context.WithTimeout(context.Background(), a.opts.timeoutOr(defaultHTTPTimeout))
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -60,12 +63,16 @@ func (a AuthenticatedResourceLocator) getHTTP() (chan Content, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("failed to get url: %s", resp.Status)
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	if resp.ContentLength > 0 && uint64(resp.ContentLength) > a.maxSize {
+		return nil, ErrorResourceTooLarge
+	}
+	b, err := readLimited(resp.Body, a.maxSize)
 	if err != nil {
 		return nil, err
 	}
@@ -75,5 +82,17 @@ func (a AuthenticatedResourceLocator) getHTTP() (chan Content, error) {
 		Data:     b,
 	}
 
-	return multiplexContent(bodyContent), nil
+	return multiplexContent(bodyContent, a.maxSize), nil
+}
+
+// readLimited reads at most max bytes, and fails if there is more.
+func readLimited(r io.Reader, max uint64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, int64(max)+1))
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(b)) > max {
+		return nil, ErrorResourceTooLarge
+	}
+	return b, nil
 }

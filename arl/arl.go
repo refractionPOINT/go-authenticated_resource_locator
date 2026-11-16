@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 )
@@ -41,6 +42,7 @@ type AuthenticatedResourceLocator struct {
 	authData   string
 
 	httpClient *http.Client
+	opts       options
 
 	get func() (chan Content, error)
 }
@@ -55,6 +57,11 @@ var ErrorMethodNotImplemented = errors.New("method not implemented")
 var ErrorAuthNotImplemented = errors.New("auth not implemented")
 var ErrorInvalidFormat = errors.New("invalid ARL format")
 var ErrorResourceNotFound = errors.New("resource not found")
+var ErrorResourceTooLarge = errors.New("maximum resource size exceeded")
+var ErrorInvalidCredentials = errors.New("invalid credentials")
+var ErrorDestinationNotAllowed = errors.New("destination address is not allowed")
+var ErrorInsecureRedirect = errors.New("redirect from https to http refused")
+var errTooManyRedirects = errors.New("stopped after 10 redirects")
 
 var supportedMethods = map[string]map[string]bool{
 	"http": {
@@ -81,12 +88,31 @@ var supportedMethods = map[string]map[string]bool{
 	},
 }
 
-func NewARLWithClient(arl string, maxSize uint64, maxConcurrent uint64, client *http.Client) (AuthenticatedResourceLocator, error) {
+// NewARLWithClient is like NewARL but uses the given http client for the http
+// and https methods (nil selects the default client). A custom client is used
+// as-is: the non-public destination guard and transport timeouts described on
+// NewARL only apply to the default client, it is up to the caller to provide
+// equivalent protections in a custom one.
+func NewARLWithClient(arl string, maxSize uint64, maxConcurrent uint64, client *http.Client, opts ...Option) (AuthenticatedResourceLocator, error) {
+	if maxSize == 0 {
+		maxSize = defaultMaxSize
+	}
+	// Keep size arithmetic within int64.
+	maxSize = min(maxSize, math.MaxInt64/2)
+	if maxConcurrent == 0 {
+		maxConcurrent = 1
+	}
 	a := AuthenticatedResourceLocator{
 		arl:           arl,
 		maxSize:       maxSize,
 		maxConcurrent: maxConcurrent,
 		httpClient:    client,
+	}
+	for _, o := range opts {
+		o(&a.opts)
+	}
+	if a.httpClient == nil {
+		a.httpClient = newHTTPClient(a.opts)
 	}
 
 	if strings.HasPrefix(arl, "https://") {
@@ -136,19 +162,45 @@ func NewARLWithClient(arl string, maxSize uint64, maxConcurrent uint64, client *
 	return a, nil
 }
 
-func NewARL(arl string, maxSize uint64, maxConcurrent uint64) (AuthenticatedResourceLocator, error) {
-	return NewARLWithClient(arl, maxSize, maxConcurrent, http.DefaultClient)
+// NewARL parses an ARL. maxSize bounds the total number of bytes fetched (and
+// expanded, for archives) by every method, 0 selects a generous default.
+//
+// By default http(s) fetches use a client with timeouts that refuses to
+// connect to non-public destinations (loopback, link-local including cloud
+// metadata, private, CGNAT, ...) at connection time, so redirects and DNS
+// answers are covered too. See WithAllowPrivateNetworks for trusted callers.
+// The gcs method only accepts Google service account keys.
+func NewARL(arl string, maxSize uint64, maxConcurrent uint64, opts ...Option) (AuthenticatedResourceLocator, error) {
+	return NewARLWithClient(arl, maxSize, maxConcurrent, nil, opts...)
 }
 
 func (a *AuthenticatedResourceLocator) Fetch() (chan Content, error) {
 	return a.get()
 }
 
-func multiplexContent(c Content) chan Content {
+// multiplexContent expands tar and zip content into its files. The total
+// expanded size is bounded by maxExpanded.
+func multiplexContent(c Content, maxExpanded uint64) chan Content {
 	out := make(chan Content, 1)
 
 	go func() {
 		defer close(out)
+
+		remaining := maxExpanded
+		// take reads one entry within the remaining budget.
+		take := func(r io.Reader) ([]byte, error) {
+			b := bytes.Buffer{}
+			n, err := io.Copy(&b, io.LimitReader(r, int64(remaining)+1))
+			if err == nil && uint64(n) > remaining {
+				err = ErrorResourceTooLarge
+			}
+			if uint64(n) >= remaining {
+				remaining = 0
+			} else {
+				remaining -= uint64(n)
+			}
+			return b.Bytes(), err
+		}
 
 		tarReader := tar.NewReader(bytes.NewReader(c.Data))
 		for {
@@ -163,12 +215,14 @@ func multiplexContent(c Content) chan Content {
 			if header.Typeflag != tar.TypeReg {
 				continue
 			}
-			newData := bytes.Buffer{}
-			_, err = io.Copy(&newData, tarReader)
+			data, err := take(tarReader)
 			out <- Content{
 				FilePath: fmt.Sprintf("/%s", header.Name),
-				Data:     newData.Bytes(),
+				Data:     data,
 				Error:    err,
+			}
+			if errors.Is(err, ErrorResourceTooLarge) {
+				return
 			}
 		}
 
@@ -180,7 +234,6 @@ func multiplexContent(c Content) chan Content {
 			return
 		}
 		for _, zipFile := range zipReader.File {
-			newData := bytes.Buffer{}
 			newFile := Content{
 				FilePath: fmt.Sprintf("/%s", zipFile.Name),
 			}
@@ -188,14 +241,14 @@ func multiplexContent(c Content) chan Content {
 			if err != nil {
 				newFile.Error = err
 			} else {
-				_, err = io.Copy(&newData, f)
-			}
-			if err != nil {
+				newFile.Data, err = take(f)
+				f.Close()
 				newFile.Error = err
-			} else {
-				newFile.Data = newData.Bytes()
 			}
 			out <- newFile
+			if errors.Is(newFile.Error, ErrorResourceTooLarge) {
+				return
+			}
 		}
 	}()
 
