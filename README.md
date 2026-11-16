@@ -40,6 +40,18 @@ GitHub repo to specific file: `[github,my-org/my-repo-name/path/to/file,token,bf
 
 You can also omit the auth components to just describe a method: `[https,my.corpwebsite.com/resourdata]`
 
+## Security and limits
+
+* **gcs** only accepts Google *service account* keys (`"type": "service_account"`, with Google's standard token endpoint). Other credential types are rejected.
+* `maxSize` bounds the bytes fetched by every method, including the total size of expanded zip/tar archives. `0` selects a generous default.
+* Fetches have timeouts (10 minutes for http(s)/github, 30 minutes for gcs by default, see `WithTimeout`).
+* The default http client refuses to connect to non-public destinations (loopback, link-local including cloud metadata, private, CGNAT, ...). The check is made when connecting, so redirects and DNS answers are covered. Trusted callers can opt out with `WithAllowPrivateNetworks()` or exempt specific networks with `WithAllowedNetworks(...)`. A custom client given to `NewARLWithClient` is used as-is.
+
+```go
+a, err := arl.NewARL(str, maxSize, maxConcurrent)                                 // default policy
+a, err := arl.NewARL(str, maxSize, maxConcurrent, arl.WithAllowPrivateNetworks()) // trusted internal callers
+```
+
 ## Return Value
 The return value is a generator of tuples (fileName, fileData).
 
