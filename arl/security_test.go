@@ -22,6 +22,7 @@ package arl
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -30,6 +31,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -248,6 +250,13 @@ func TestSanitizeServiceAccountKey(t *testing.T) {
 // client's emulator mode) to exercise listing and downloading.
 func fakeGCS(t *testing.T, objects map[string][]byte, listStatus int) {
 	t.Helper()
+	fakeGCSStalling(t, objects, listStatus, nil)
+}
+
+// fakeGCSStalling is fakeGCS where downloads of the named objects never
+// complete.
+func fakeGCSStalling(t *testing.T, objects map[string][]byte, listStatus int, stall map[string]bool) {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if listStatus != 0 && strings.HasSuffix(r.URL.Path, "/o") {
 			http.Error(w, `{"error":{"code":403,"message":"forbidden"}}`, listStatus)
@@ -263,6 +272,12 @@ func fakeGCS(t *testing.T, objects map[string][]byte, listStatus int) {
 		}
 		for n, d := range objects {
 			if strings.HasSuffix(r.URL.Path, "/"+n) {
+				if stall[n] {
+					w.Write(d[:1])
+					w.(http.Flusher).Flush()
+					<-r.Context().Done()
+					return
+				}
 				w.Write(d)
 				return
 			}
@@ -601,7 +616,7 @@ func TestIsBlockedAddr(t *testing.T) {
 		"100.64.0.1", "100.127.255.255", "224.0.0.1", "255.255.255.255", "240.0.0.1",
 		"::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:10.0.0.1",
 		"64:ff9b::a9fe:a9fe", "64:ff9b::7f00:1", "2002:a9fe:a9fe::1", "2002:7f00:1::1",
-		"198.18.0.1", "2001::1",
+		"198.18.0.1", "2001::1", "2001:20::1", "192.88.99.1", "2001:2::1", "2001:10::1",
 	}
 	for _, s := range blocked {
 		if !isBlockedAddr(netip.MustParseAddr(s)) {
@@ -622,4 +637,268 @@ func TestIsBlockedAddr(t *testing.T) {
 
 func writeFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0600)
+}
+
+// Once the deadline has passed, a consumer that can still take entries
+// gets them: expiry decides when sends would block, it must not randomly
+// drop the last entries.
+func TestExpiredDeadlineDeliversToActiveConsumer(t *testing.T) {
+	archive := makeZip(t, map[string][]byte{"a": []byte("aa"), "b": []byte("bb")})
+	for i := 0; i < 5; i++ {
+		out := make(chan Content, 8)
+		done := make(chan struct{})
+		go func() {
+			expandArchive(out, Content{Data: archive}, 1024*1024, time.Now().Add(-time.Millisecond))
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("abandoned expansion did not give up")
+		}
+		close(out)
+		n, sawError := 0, false
+		for c := range out {
+			n++
+			if c.Error != nil {
+				sawError = true
+			}
+		}
+		if n != 2 || sawError {
+			t.Fatalf("attempt %d: got %d entries, error seen: %v", i, n, sawError)
+		}
+	}
+}
+
+// The terminal error must survive a consumer that only reads after the
+// grace period: a late reader can never mistake an incomplete fetch for
+// a complete one.
+func TestTerminalErrorSurvivesAbandonedConsumer(t *testing.T) {
+	old := abandonGrace
+	abandonGrace = 150 * time.Millisecond
+	t.Cleanup(func() { abandonGrace = old })
+
+	z := makeZip(t, map[string][]byte{"one": []byte("1"), "two": []byte("2"), "three": []byte("3")})
+	out := make(chan Content, 1)
+	done := make(chan struct{})
+	go func() {
+		expandArchive(out, Content{Data: z}, 1024*1024, time.Now().Add(50*time.Millisecond))
+		close(done)
+	}()
+	// The consumer only starts reading once the expansion has run out of
+	// time, given up on it, and returned.
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("abandoned expansion did not give up")
+	}
+	var last Content
+	select {
+	case last = <-out:
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal message not observable after the grace period")
+	}
+	// Only the terminal message is observable, the unread data entry
+	// made room for it.
+	select {
+	case c := <-out:
+		t.Fatalf("unexpected extra message: %+v", c)
+	default:
+	}
+	if !errors.Is(last.Error, context.DeadlineExceeded) {
+		t.Fatalf("terminal state lost, got: %v", last.Error)
+	}
+}
+
+// The incomplete error always identifies itself, with or without a cause
+// from the context.
+func TestIncompleteError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	err := incompleteError(ctx)
+	if !errors.Is(err, ErrorIncompleteFetch) {
+		t.Errorf("missing sentinel: %v", err)
+	}
+	if got := err.Error(); strings.Contains(got, "%!w") {
+		t.Errorf("broken error text: %s", got)
+	}
+	cancel()
+	if !errors.Is(incompleteError(ctx), context.Canceled) {
+		t.Errorf("canceled cause lost: %v", incompleteError(ctx))
+	}
+}
+
+func TestSizeAndConcurrencyClamps(t *testing.T) {
+	// A pathological maxSize cannot push size arithmetic out of int64
+	// range, and a pathological maxConcurrent cannot spawn an
+	// unbounded number of workers.
+	a, err := NewARL("[https,example.com/x]", 1<<62, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.maxSize > uint64(math.MaxInt64/2) {
+		t.Errorf("maxSize not clamped: %d", a.maxSize)
+	}
+	if a.maxConcurrent > maxConcurrentLimit {
+		t.Errorf("maxConcurrent not clamped: %d", a.maxConcurrent)
+	}
+
+	// Zero values select generous defaults, never unbounded fetches.
+	a, err = NewARL("[https,example.com/x]", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.maxSize != defaultMaxSize {
+		t.Errorf("default maxSize = %d, want %d", a.maxSize, defaultMaxSize)
+	}
+	if a.maxConcurrent != 1 {
+		t.Errorf("default maxConcurrent = %d, want 1", a.maxConcurrent)
+	}
+}
+
+func TestAbandonedMultiplexIsBounded(t *testing.T) {
+	// A consumer that never reads holds the expansion for at most the
+	// deadline plus the grace period for the final message.
+	old := abandonGrace
+	abandonGrace = 200 * time.Millisecond
+	defer func() { abandonGrace = old }()
+
+	archive := makeZip(t, map[string][]byte{"a": []byte("aa"), "b": []byte("bb"), "c": []byte("cc")})
+	out := make(chan Content, 1)
+	done := make(chan struct{})
+	go func() {
+		expandArchive(out, Content{Data: archive}, 1024*1024, time.Now().Add(50*time.Millisecond))
+		close(done)
+	}()
+	// Nothing reads from out: the first entry fills the buffer, the
+	// second blocks.
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("abandoned expansion did not give up")
+	}
+}
+
+func shortGrace(t *testing.T) {
+	old := abandonGrace
+	abandonGrace = 5 * time.Second
+	t.Cleanup(func() { abandonGrace = old })
+}
+
+// A fetch that runs out of time must say so: closing the channel normally
+// would look like a complete (possibly empty) result.
+func TestGCSDeadlineIsReported(t *testing.T) {
+	shortGrace(t)
+	fakeGCSStalling(t, map[string][]byte{
+		"prefix/fast.txt": []byte("fast"),
+		"prefix/slow.txt": []byte("slow"),
+	}, 0, map[string]bool{"prefix/slow.txt": true})
+
+	for i := 0; i < 2; i++ {
+		a, err := NewARL(gcsARL(t, saKey(t, nil)), 1024, 2, WithTimeout(3*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := a.Fetch()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sawError, sawFast := false, false
+		for c := range ch {
+			if c.Error != nil {
+				sawError = true
+			} else if c.FilePath == "gcs://some-bucket/prefix/fast.txt" {
+				sawFast = true
+			}
+		}
+		if !sawError {
+			t.Fatalf("attempt %d: stalled download closed the channel without an error", i)
+		}
+		if !sawFast {
+			t.Fatalf("attempt %d: completed object was not delivered", i)
+		}
+	}
+}
+
+func TestGCSSlowConsumerGetsIncompleteError(t *testing.T) {
+	shortGrace(t)
+	fakeGCS(t, map[string][]byte{"prefix/a.txt": []byte("a"), "prefix/b.txt": []byte("b")}, 0)
+	a, err := NewARL(gcsARL(t, saKey(t, nil)), 1024, 1, WithTimeout(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := a.Fetch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Not reading until after the deadline.
+	time.Sleep(3 * time.Second)
+	var last Content
+	for c := range ch {
+		last = c
+	}
+	if !errors.Is(last.Error, context.DeadlineExceeded) {
+		t.Errorf("expected the last message to report the deadline, got %v", last.Error)
+	}
+}
+
+func TestMultiplexDeadlineIsReported(t *testing.T) {
+	shortGrace(t)
+	z := makeZip(t, map[string][]byte{"one": []byte("1"), "two": []byte("2"), "three": []byte("3")})
+	ch := multiplexContent(Content{Data: z}, 1024*1024, time.Now().Add(50*time.Millisecond))
+	// The consumer starts reading long after the deadline but well
+	// within the grace period, leaving the producer a wide margin to be
+	// scheduled late: the deadline is only missed if the goroutine does
+	// not start within seconds.
+	time.Sleep(3 * time.Second)
+	var last Content
+	for c := range ch {
+		last = c
+	}
+	if !errors.Is(last.Error, context.DeadlineExceeded) {
+		t.Errorf("expected the last message to report the deadline, got %v", last.Error)
+	}
+}
+
+// net/http rebuilds the request headers of every hop from the original
+// request, the key must stay out of all hops that leave the original host.
+func TestOTXKeyNotForwardedOnLaterHops(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.2:0")
+	if err != nil {
+		t.Skipf("cannot bind 127.0.0.2: %v", err)
+	}
+	seen := make(chan string, 4)
+	other := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.URL.Path + "=" + r.Header.Get("X-OTX-API-KEY")
+		if r.URL.Path == "/hop1" {
+			http.Redirect(w, r, "/hop2", http.StatusFound)
+			return
+		}
+		w.Write([]byte("ok"))
+	}))
+	other.Listener.Close()
+	other.Listener = l
+	other.Start()
+	defer other.Close()
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/hop1", http.StatusFound)
+	}))
+	defer first.Close()
+
+	a, _ := NewARL("[http,"+first.Listener.Addr().String()+"/x,otx,k]", 1024, 2, WithAllowedNetworks(netip.MustParsePrefix("127.0.0.0/24")))
+	ch, err := a.Fetch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(ch)
+	close(seen)
+	n := 0
+	for s := range seen {
+		n++
+		if !strings.HasSuffix(s, "=") {
+			t.Errorf("api key forwarded to another host: %s", s)
+		}
+	}
+	if n != 2 {
+		t.Errorf("expected 2 requests to the other host, got %d", n)
+	}
 }

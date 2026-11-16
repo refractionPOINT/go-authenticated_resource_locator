@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/iterator"
@@ -89,7 +90,8 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), a.opts.timeoutOr(defaultGCSTimeout))
+	deadline := time.Now().Add(a.opts.timeoutOr(defaultGCSTimeout))
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	client, err := storage.NewClient(ctx,
 		option.WithAuthCredentialsJSON(option.ServiceAccount, keyJSON),
 		option.WithScopes(storage.ScopeReadOnly),
@@ -132,18 +134,32 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 		blobs = append(blobs, attrs)
 	}
 
-	chOut := make(chan Content)
+	// The buffer gives the terminal message of the fetch room to be
+	// observable even when the consumer stops reading (see
+	// deliverTerminal).
+	chOut := make(chan Content, 1)
 	chIn := make(chan *storage.ObjectAttrs)
 	wg := sync.WaitGroup{}
 	downloaded := atomic.Uint64{}
 
 	// send gives up when the deadline passes so an abandoned consumer
-	// cannot pin the workers forever.
+	// cannot pin the workers forever. The non-blocking attempt first: a
+	// consumer that is actively reading gets the last objects even once
+	// the deadline has passed, expiry only decides when sends block.
+	// A dropped message means the fetch is incomplete, which is reported
+	// to the consumer before the channel is closed.
+	incomplete := atomic.Bool{}
 	send := func(c Content) bool {
 		select {
 		case chOut <- c:
 			return true
+		default:
+		}
+		select {
+		case chOut <- c:
+			return true
 		case <-ctx.Done():
+			incomplete.Store(true)
 			return false
 		}
 	}
@@ -175,7 +191,7 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 				// If there was only one blob, we check if
 				// it's an archive and multiplex it.
 				if len(blobs) == 1 && out.Error == nil {
-					parts := multiplexContent(out, a.maxSize)
+					parts := multiplexContent(out, a.maxSize, deadline)
 					for b := range parts {
 						if !send(b) {
 							go func() {
@@ -200,6 +216,7 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 			select {
 			case chIn <- b:
 			case <-ctx.Done():
+				incomplete.Store(true)
 				return
 			}
 		}
@@ -207,6 +224,9 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 
 	go func() {
 		wg.Wait()
+		if incomplete.Load() {
+			deliverTerminal(chOut, Content{Error: incompleteError(ctx)})
+		}
 		client.Close()
 		cancel()
 		close(chOut)

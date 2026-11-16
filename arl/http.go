@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 func (a AuthenticatedResourceLocator) getHTTP() (chan Content, error) {
@@ -36,8 +37,10 @@ func (a AuthenticatedResourceLocator) getHTTP() (chan Content, error) {
 		return nil, ErrorMethodNotImplemented
 	}
 
-	// The context bounds the whole transfer, including the body.
-	ctx, cancel := context.WithTimeout(context.Background(), a.opts.timeoutOr(defaultHTTPTimeout))
+	// The context bounds the whole transfer, including the body, and the
+	// archive expansion of a single object shares the same budget.
+	deadline := time.Now().Add(a.opts.timeoutOr(defaultHTTPTimeout))
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
@@ -82,7 +85,7 @@ func (a AuthenticatedResourceLocator) getHTTP() (chan Content, error) {
 		Data:     b,
 	}
 
-	return multiplexContent(bodyContent, a.maxSize), nil
+	return multiplexContent(bodyContent, a.maxSize, deadline), nil
 }
 
 // readLimited reads at most max bytes, and fails if there is more.

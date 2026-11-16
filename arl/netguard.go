@@ -31,6 +31,7 @@ var blockedPrefixes = mustPrefixes(
 	"100.64.0.0/10",   // CGNAT
 	"192.0.0.0/24",    // IETF protocol assignments
 	"192.0.2.0/24",    // documentation
+	"192.88.99.0/24",  // deprecated 6to4 relay anycast
 	"198.18.0.0/15",   // benchmarking
 	"198.51.100.0/24", // documentation
 	"203.0.113.0/24",  // documentation
@@ -40,6 +41,9 @@ var blockedPrefixes = mustPrefixes(
 	"64:ff9b:1::/48",  // local-use NAT64
 	"100::/64",        // discard-only
 	"2001::/32",       // Teredo
+	"2001:2::/48",     // benchmarking
+	"2001:10::/28",    // ORCHID (deprecated)
+	"2001:20::/28",    // ORCHIDv2
 	"2001:db8::/32",   // documentation
 	"fec0::/10",       // deprecated site-local
 )
@@ -139,7 +143,10 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	if prev.URL.Scheme == "https" && req.URL.Scheme != "https" {
 		return ErrorInsecureRedirect
 	}
-	if prev.URL.Host != req.URL.Host {
+	// net/http rebuilds the headers of every hop from the original request,
+	// so the key must be dropped on every hop leaving the original host,
+	// not only the first.
+	if via[0].URL.Host != req.URL.Host {
 		req.Header.Del("X-OTX-API-KEY")
 	}
 	return nil

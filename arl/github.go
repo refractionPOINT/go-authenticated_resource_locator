@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-git/go-git/v5"
@@ -102,8 +103,11 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 	}
 	gitOptions.Auth = pubKey
 
-	// Clone the repo in memory.
-	cloneCtx, cancelClone := context.WithTimeout(context.Background(), a.opts.timeoutOr(tarballFetchTimeout))
+	// The clone and the file iteration share one time budget, so the
+	// goroutine cannot outlive the fetch deadline by starting a second
+	// one after the clone.
+	deadline := time.Now().Add(a.opts.timeoutOr(tarballFetchTimeout))
+	cloneCtx, cancelClone := context.WithDeadline(context.Background(), deadline)
 	defer cancelClone()
 	r, err := git.CloneContext(cloneCtx, memory.NewStorage(), nil, &gitOptions)
 	if err != nil {
@@ -132,6 +136,25 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 	chOut := make(chan Content, a.maxConcurrent)
 	go func() {
 		defer close(chOut)
+		// send gives up when the deadline passes so an abandoned
+		// consumer cannot pin the iteration (and the in-memory
+		// clone) forever. The deadline is whatever is left of the
+		// budget already spent by the clone.
+		sendCtx, cancelSends := context.WithDeadline(context.Background(), deadline)
+		defer cancelSends()
+		send := func(c Content) error {
+			select {
+			case chOut <- c:
+				return nil
+			default:
+			}
+			select {
+			case chOut <- c:
+				return nil
+			case <-sendCtx.Done():
+				return incompleteError(sendCtx)
+			}
+		}
 		totalSize := uint64(0)
 		err := tree.Files().ForEach(func(f *object.File) error {
 			if !strings.HasPrefix(f.Name, pathInRepo) {
@@ -152,14 +175,13 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 			if err != nil {
 				return fmt.Errorf("failed to read blob: %v", err)
 			}
-			chOut <- Content{
+			return send(Content{
 				FilePath: f.Name,
 				Data:     data,
-			}
-			return nil
+			})
 		})
 		if err != nil {
-			chOut <- Content{Error: err}
+			deliverTerminal(chOut, Content{Error: err})
 		}
 	}()
 
@@ -213,6 +235,25 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 		defer resp.Body.Close()
 		defer gzReader.Close()
 
+		// send gives up when the deadline passes so an abandoned
+		// consumer cannot pin the transfer forever. The non-blocking
+		// attempt first: a consumer that is actively reading gets the
+		// last entries even once the deadline has passed, expiry only
+		// decides when sends would block.
+		send := func(c Content) bool {
+			select {
+			case chOut <- c:
+				return true
+			default:
+			}
+			select {
+			case chOut <- c:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+
 		totalSize := uint64(0)
 		tarReader := tar.NewReader(gzReader)
 		for {
@@ -221,7 +262,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 				return
 			}
 			if err != nil {
-				chOut <- Content{Error: fmt.Errorf("failed to read repo tarball: %v", err)}
+				deliverTerminal(chOut, Content{Error: fmt.Errorf("failed to read repo tarball: %v", err)})
 				return
 			}
 			// We only care about regular files.
@@ -242,18 +283,21 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 			if a.maxSize != 0 {
 				totalSize += uint64(header.Size)
 				if totalSize > a.maxSize {
-					chOut <- Content{Error: fmt.Errorf("maximum resource size reached (%d bytes)", a.maxSize)}
+					deliverTerminal(chOut, Content{Error: fmt.Errorf("maximum resource size reached (%d bytes)", a.maxSize)})
 					return
 				}
 			}
 			data, err := readLimited(tarReader, a.maxSize)
 			if err != nil {
-				chOut <- Content{FilePath: name, Error: fmt.Errorf("failed to read %s from repo tarball: %v", name, err)}
+				deliverTerminal(chOut, Content{FilePath: name, Error: fmt.Errorf("failed to read %s from repo tarball: %v", name, err)})
 				return
 			}
-			chOut <- Content{
+			if !send(Content{
 				FilePath: name,
 				Data:     data,
+			}) {
+				deliverTerminal(chOut, Content{Error: incompleteError(ctx)})
+				return
 			}
 		}
 	}()
@@ -302,7 +346,8 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 		return nil, ErrorAuthNotImplemented
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), a.opts.timeoutOr(defaultHTTPTimeout))
+	deadline := time.Now().Add(a.opts.timeoutOr(defaultHTTPTimeout))
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	gh := &githubFetcher{ctx: ctx, client: a.httpClient, maxSize: a.maxSize, auth: authHeaders}
 
 	paths, err := gh.listFiles(fullURL, repoPath, repoParams)
@@ -323,7 +368,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 			FilePath: paths[0].Path,
 			Data:     data,
 		}
-		return multiplexContent(tmpContent, a.maxSize), nil
+		return multiplexContent(tmpContent, a.maxSize, deadline), nil
 	}
 
 	chIn := make(chan githubFileRecord, len(paths))
@@ -335,6 +380,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 
 	chOut := make(chan Content, a.maxConcurrent)
 	wg := sync.WaitGroup{}
+	incomplete := atomic.Bool{}
 
 	for i := 0; uint64(i) < a.maxConcurrent; i++ {
 		wg.Add(1)
@@ -349,17 +395,39 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 				data, err := gh.download(gr.DownloadURL)
 				if err != nil {
 					tmpContent.Error = err
-					chOut <- tmpContent
+					// Not the terminal message of the fetch (other
+					// workers keep going), but if nobody takes it
+					// the fetch result is incomplete. Past the
+					// deadline the coordinator's terminal delivery
+					// takes over without waiting the grace again.
+					if !deliverFinal(chOut, tmpContent, gh.ctx.Done()) {
+						incomplete.Store(true)
+					}
 					return
 				}
 				tmpContent.Data = data
-				chOut <- tmpContent
+				select {
+				case chOut <- tmpContent:
+				default:
+					// The non-blocking attempt failed: wait for
+					// the consumer or the deadline, an active
+					// consumer still gets the file.
+					select {
+					case chOut <- tmpContent:
+					case <-gh.ctx.Done():
+						incomplete.Store(true)
+						return
+					}
+				}
 			}
 		}()
 	}
 
 	go func() {
 		wg.Wait()
+		if incomplete.Load() {
+			deliverTerminal(chOut, Content{Error: incompleteError(gh.ctx)})
+		}
 		cancel()
 		close(chOut)
 	}()

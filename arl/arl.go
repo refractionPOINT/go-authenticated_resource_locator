@@ -23,12 +23,14 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type AuthenticatedResourceLocator struct {
@@ -102,6 +104,9 @@ func NewARLWithClient(arl string, maxSize uint64, maxConcurrent uint64, client *
 	if maxConcurrent == 0 {
 		maxConcurrent = 1
 	}
+	// Keep a pathological value from spawning an unbounded number of
+	// concurrent fetch workers.
+	maxConcurrent = min(maxConcurrent, maxConcurrentLimit)
 	a := AuthenticatedResourceLocator{
 		arl:           arl,
 		maxSize:       maxSize,
@@ -178,13 +183,112 @@ func (a *AuthenticatedResourceLocator) Fetch() (chan Content, error) {
 	return a.get()
 }
 
+// ErrorIncompleteFetch reports a fetch that ended without delivering
+// everything: a consumer stopped reading, or a message had to be dropped.
+var ErrorIncompleteFetch = errors.New("fetch incomplete")
+
+// abandonGrace is how long the terminal message of a fetch waits for a
+// consumer once the fetch has run out of time; past that the consumer is
+// considered gone.
+var abandonGrace = 10 * time.Second
+
+// deliverFinal hands the last message of a producer to the consumer.
+// The non-blocking attempt comes first, so a consumer with room gets the
+// message immediately, even once the deadline has closed the done
+// channel. It then waits for the consumer as long as the fetch lives
+// (the done channel, i.e. the fetch deadline, bounds the wait), and
+// reports whether the message was delivered: a dropped message means
+// the fetch result is incomplete.
+func deliverFinal(out chan<- Content, c Content, done <-chan struct{}) bool {
+	select {
+	case out <- c:
+		return true
+	default:
+	}
+	select {
+	case out <- c:
+		return true
+	case <-done:
+		return false
+	}
+}
+
+// deliverTerminal hands the terminal message of a fetch to the consumer.
+// Like deliverFinal it waits for a consumer that may still arrive, but
+// unlike it the message is never dropped: a consumer that reads later must
+// never mistake a partial or empty fetch for a complete one. Once the grace
+// period passes it makes room for the terminal message by discarding an
+// unread buffered data message. The caller must only call it when no other
+// producer can send on out, and out must be buffered (all fetch channels
+// are), so the final send cannot block.
+func deliverTerminal(out chan Content, c Content) {
+	t := time.NewTimer(abandonGrace)
+	defer t.Stop()
+	select {
+	case out <- c:
+		return
+	case <-t.C:
+	}
+	// Nobody is reading. Drop an unread data message to make the
+	// terminal state observable to whoever reads later. The channel is
+	// buffered and we are the only remaining sender, so the send below
+	// always has room.
+	select {
+	case <-out:
+	default:
+	}
+	out <- c
+}
+
+func incompleteError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %w", ErrorIncompleteFetch, err)
+	}
+	// The fetch ended without its context being cancelled (for example
+	// a message was dropped while the consumer was slow): still
+	// incomplete, but no cause to wrap.
+	return ErrorIncompleteFetch
+}
+
 // multiplexContent expands tar and zip content into its files. The total
-// expanded size is bounded by maxExpanded.
-func multiplexContent(c Content, maxExpanded uint64) chan Content {
+// expanded size is bounded by maxExpanded, and an abandoned consumer can
+// hold the expansion for at most the remaining time until deadline (plus
+// the grace period of the final message).
+func multiplexContent(c Content, maxExpanded uint64, deadline time.Time) chan Content {
 	out := make(chan Content, 1)
 
 	go func() {
 		defer close(out)
+		expandArchive(out, c, maxExpanded, deadline)
+	}()
+
+	return out
+}
+
+// expandArchive does the work of multiplexContent, returning once everything
+// was sent, the consumer was given up on, or the budget ran out.
+func expandArchive(out chan Content, c Content, maxExpanded uint64, deadline time.Time) {
+	{
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		defer cancel()
+		// send gives up when the deadline passes so an abandoned
+		// consumer cannot pin the expansion forever. The non-blocking
+		// attempt first: a consumer that is actively reading gets the
+		// last entries even once the deadline has passed, expiry only
+		// decides when sends would block.
+		send := func(c Content) bool {
+			select {
+			case out <- c:
+				return true
+			default:
+			}
+			select {
+			case out <- c:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
 
 		remaining := maxExpanded
 		// take reads one entry within the remaining budget.
@@ -216,10 +320,13 @@ func multiplexContent(c Content, maxExpanded uint64) chan Content {
 				continue
 			}
 			data, err := take(tarReader)
-			out <- Content{
+			if !send(Content{
 				FilePath: fmt.Sprintf("/%s", header.Name),
 				Data:     data,
 				Error:    err,
+			}) {
+				deliverTerminal(out, Content{Error: incompleteError(ctx)})
+				return
 			}
 			if errors.Is(err, ErrorResourceTooLarge) {
 				return
@@ -230,7 +337,9 @@ func multiplexContent(c Content, maxExpanded uint64) chan Content {
 		if err != nil {
 			// So this was not a tar and not a zip, we'll just return
 			// the file as-is.
-			out <- c
+			if !send(c) {
+				deliverTerminal(out, Content{Error: incompleteError(ctx)})
+			}
 			return
 		}
 		for _, zipFile := range zipReader.File {
@@ -245,12 +354,13 @@ func multiplexContent(c Content, maxExpanded uint64) chan Content {
 				f.Close()
 				newFile.Error = err
 			}
-			out <- newFile
+			if !send(newFile) {
+				deliverTerminal(out, Content{Error: incompleteError(ctx)})
+				return
+			}
 			if errors.Is(newFile.Error, ErrorResourceTooLarge) {
 				return
 			}
 		}
-	}()
-
-	return out
+	}
 }
