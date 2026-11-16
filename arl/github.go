@@ -143,7 +143,7 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 			case chOut <- c:
 				return nil
 			case <-sendCtx.Done():
-				return sendCtx.Err()
+				return incompleteError(sendCtx)
 			}
 		}
 		totalSize := uint64(0)

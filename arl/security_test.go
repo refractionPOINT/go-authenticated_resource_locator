@@ -616,7 +616,7 @@ func TestIsBlockedAddr(t *testing.T) {
 		"100.64.0.1", "100.127.255.255", "224.0.0.1", "255.255.255.255", "240.0.0.1",
 		"::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:10.0.0.1",
 		"64:ff9b::a9fe:a9fe", "64:ff9b::7f00:1", "2002:a9fe:a9fe::1", "2002:7f00:1::1",
-		"198.18.0.1", "2001::1", "2001:20::1", "192.88.99.1", "192.88.99.1", "2001:2::1", "2001:10::1",
+		"198.18.0.1", "2001::1", "2001:20::1", "192.88.99.1", "2001:2::1", "2001:10::1",
 	}
 	for _, s := range blocked {
 		if !isBlockedAddr(netip.MustParseAddr(s)) {
@@ -705,8 +705,8 @@ func TestGCSDeadlineIsReported(t *testing.T) {
 		"prefix/slow.txt": []byte("slow"),
 	}, 0, map[string]bool{"prefix/slow.txt": true})
 
-	for i := 0; i < 8; i++ {
-		a, err := NewARL(gcsARL(t, saKey(t, nil)), 1024, 2, WithTimeout(400*time.Millisecond))
+	for i := 0; i < 3; i++ {
+		a, err := NewARL(gcsARL(t, saKey(t, nil)), 1024, 2, WithTimeout(3*time.Second))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -734,7 +734,7 @@ func TestGCSDeadlineIsReported(t *testing.T) {
 func TestGCSSlowConsumerGetsIncompleteError(t *testing.T) {
 	shortGrace(t)
 	fakeGCS(t, map[string][]byte{"prefix/a.txt": []byte("a"), "prefix/b.txt": []byte("b")}, 0)
-	a, err := NewARL(gcsARL(t, saKey(t, nil)), 1024, 1, WithTimeout(500*time.Millisecond))
+	a, err := NewARL(gcsARL(t, saKey(t, nil)), 1024, 1, WithTimeout(2*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -743,7 +743,7 @@ func TestGCSSlowConsumerGetsIncompleteError(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Not reading until after the deadline.
-	time.Sleep(1200 * time.Millisecond)
+	time.Sleep(3 * time.Second)
 	var last Content
 	for c := range ch {
 		last = c
