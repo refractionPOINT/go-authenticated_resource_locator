@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 )
@@ -96,6 +97,8 @@ func NewARLWithClient(arl string, maxSize uint64, maxConcurrent uint64, client *
 	if maxSize == 0 {
 		maxSize = defaultMaxSize
 	}
+	// Keep size arithmetic within int64.
+	maxSize = min(maxSize, math.MaxInt64/2)
 	if maxConcurrent == 0 {
 		maxConcurrent = 1
 	}
