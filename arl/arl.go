@@ -191,13 +191,18 @@ var abandonGrace = 10 * time.Second
 // Unlike the regular sends it does not depend on the fetch deadline, which
 // may already have passed. It reports whether the message was delivered:
 // a dropped message means the consumer is gone, so the fetch is incomplete.
-func deliverFinal(out chan<- Content, c Content) bool {
+// If done is non-nil it also gives up when it closes: past the fetch
+// deadline the terminal delivery of the fetch takes over, so waiting the
+// full grace again would only extend the fetch's lifetime.
+func deliverFinal(out chan<- Content, c Content, done <-chan struct{}) bool {
 	t := time.NewTimer(abandonGrace)
 	defer t.Stop()
 	select {
 	case out <- c:
 		return true
 	case <-t.C:
+		return false
+	case <-done:
 		return false
 	}
 }

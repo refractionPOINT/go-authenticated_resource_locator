@@ -397,8 +397,10 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 					tmpContent.Error = err
 					// Not the terminal message of the fetch (other
 					// workers keep going), but if nobody takes it
-					// the fetch result is incomplete.
-					if !deliverFinal(chOut, tmpContent) {
+					// the fetch result is incomplete. Past the
+					// deadline the coordinator's terminal delivery
+					// takes over without waiting the grace again.
+					if !deliverFinal(chOut, tmpContent, gh.ctx.Done()) {
 						incomplete.Store(true)
 					}
 					return

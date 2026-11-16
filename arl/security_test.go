@@ -651,7 +651,11 @@ func TestExpiredDeadlineDeliversToActiveConsumer(t *testing.T) {
 			expandArchive(out, Content{Data: archive}, 1024*1024, time.Now().Add(-time.Millisecond))
 			close(done)
 		}()
-		<-done
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("abandoned expansion did not give up")
+		}
 		close(out)
 		n, sawError := 0, false
 		for c := range out {
