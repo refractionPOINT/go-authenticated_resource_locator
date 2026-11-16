@@ -827,8 +827,12 @@ func TestGCSSlowConsumerGetsIncompleteError(t *testing.T) {
 func TestMultiplexDeadlineIsReported(t *testing.T) {
 	shortGrace(t)
 	z := makeZip(t, map[string][]byte{"one": []byte("1"), "two": []byte("2"), "three": []byte("3")})
-	ch := multiplexContent(Content{Data: z}, 1024*1024, time.Now().Add(300*time.Millisecond))
-	time.Sleep(900 * time.Millisecond)
+	ch := multiplexContent(Content{Data: z}, 1024*1024, time.Now().Add(50*time.Millisecond))
+	// The consumer starts reading long after the deadline but well
+	// within the grace period, leaving the producer a wide margin to be
+	// scheduled late: the deadline is only missed if the goroutine does
+	// not start within seconds.
+	time.Sleep(3 * time.Second)
 	var last Content
 	for c := range ch {
 		last = c
