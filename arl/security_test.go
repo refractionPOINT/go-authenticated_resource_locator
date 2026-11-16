@@ -639,6 +639,33 @@ func writeFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0600)
 }
 
+// Once the deadline has passed, a consumer that can still take entries
+// gets them: expiry decides when sends would block, it must not randomly
+// drop the last entries.
+func TestExpiredDeadlineDeliversToActiveConsumer(t *testing.T) {
+	archive := makeZip(t, map[string][]byte{"a": []byte("aa"), "b": []byte("bb")})
+	for i := 0; i < 5; i++ {
+		out := make(chan Content, 8)
+		done := make(chan struct{})
+		go func() {
+			expandArchive(out, Content{Data: archive}, 1024*1024, time.Now().Add(-time.Millisecond))
+			close(done)
+		}()
+		<-done
+		close(out)
+		n, sawError := 0, false
+		for c := range out {
+			n++
+			if c.Error != nil {
+				sawError = true
+			}
+		}
+		if n != 2 || sawError {
+			t.Fatalf("attempt %d: got %d entries, error seen: %v", i, n, sawError)
+		}
+	}
+}
+
 func TestSizeAndConcurrencyClamps(t *testing.T) {
 	// A pathological maxSize cannot push size arithmetic out of int64
 	// range, and a pathological maxConcurrent cannot spawn an

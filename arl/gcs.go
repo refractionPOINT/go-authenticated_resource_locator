@@ -140,11 +140,18 @@ func (a AuthenticatedResourceLocator) getGCS() (chan Content, error) {
 	downloaded := atomic.Uint64{}
 
 	// send gives up when the deadline passes so an abandoned consumer
-	// cannot pin the workers forever.
+	// cannot pin the workers forever. The non-blocking attempt first: a
+	// consumer that is actively reading gets the last objects even once
+	// the deadline has passed, expiry only decides when sends block.
 	// A dropped message means the fetch is incomplete, which is reported
 	// to the consumer before the channel is closed.
 	incomplete := atomic.Bool{}
 	send := func(c Content) bool {
+		select {
+		case chOut <- c:
+			return true
+		default:
+		}
 		select {
 		case chOut <- c:
 			return true

@@ -226,8 +226,16 @@ func expandArchive(out chan Content, c Content, maxExpanded uint64, deadline tim
 		ctx, cancel := context.WithDeadline(context.Background(), deadline)
 		defer cancel()
 		// send gives up when the deadline passes so an abandoned
-		// consumer cannot pin the expansion forever.
+		// consumer cannot pin the expansion forever. The non-blocking
+		// attempt first: a consumer that is actively reading gets the
+		// last entries even once the deadline has passed, expiry only
+		// decides when sends would block.
 		send := func(c Content) bool {
+			select {
+			case out <- c:
+				return true
+			default:
+			}
 			select {
 			case out <- c:
 				return true

@@ -146,6 +146,11 @@ func (a AuthenticatedResourceLocator) getGitHubFromGit() (chan Content, error) {
 			select {
 			case chOut <- c:
 				return nil
+			default:
+			}
+			select {
+			case chOut <- c:
+				return nil
 			case <-sendCtx.Done():
 				return incompleteError(sendCtx)
 			}
@@ -231,8 +236,16 @@ func (a AuthenticatedResourceLocator) getGitHubFromTarball(repoPath string, path
 		defer gzReader.Close()
 
 		// send gives up when the deadline passes so an abandoned
-		// consumer cannot pin the transfer forever.
+		// consumer cannot pin the transfer forever. The non-blocking
+		// attempt first: a consumer that is actively reading gets the
+		// last entries even once the deadline has passed, expiry only
+		// decides when sends would block.
 		send := func(c Content) bool {
+			select {
+			case chOut <- c:
+				return true
+			default:
+			}
 			select {
 			case chOut <- c:
 				return true
@@ -388,9 +401,16 @@ func (a AuthenticatedResourceLocator) getGitHubFromAPI() (chan Content, error) {
 				tmpContent.Data = data
 				select {
 				case chOut <- tmpContent:
-				case <-gh.ctx.Done():
-					incomplete.Store(true)
-					return
+				default:
+					// The non-blocking attempt failed: wait for
+					// the consumer or the deadline, an active
+					// consumer still gets the file.
+					select {
+					case chOut <- tmpContent:
+					case <-gh.ctx.Done():
+						incomplete.Store(true)
+						return
+					}
 				}
 			}
 		}()
